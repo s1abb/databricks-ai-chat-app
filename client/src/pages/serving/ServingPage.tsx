@@ -64,6 +64,7 @@ const EXAMPLE_PROMPTS = [
 export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
+  const [chats, setChats] = useState<ChatSummary[]>([]);
   const [chatId, setChatId] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
   const [connected, setConnected] = useState(false);
@@ -76,26 +77,34 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, loading]);
 
-  async function loadMostRecentChat() {
+  async function refreshChats(): Promise<ChatSummary[]> {
+    const list: ChatSummary[] = await fetch('/api/chats').then((r) => r.json());
+    setChats(list);
+    return list;
+  }
+
+  async function loadMessagesFor(id: string) {
+    const history: Message[] = await fetch(`/api/chats/${id}/messages`).then((r) => r.json());
+    setMessages(history);
+  }
+
+  async function init() {
     setReady(false);
     try {
-      const chats: ChatSummary[] = await fetch('/api/chats').then((r) => r.json());
+      const list = await refreshChats();
 
       let activeId: string;
-      if (chats.length > 0) {
-        activeId = chats[0].id;
+      if (list.length > 0) {
+        activeId = list[0].id;
       } else {
         const created: ChatSummary = await fetch('/api/chats', { method: 'POST' }).then((r) =>
           r.json(),
         );
         activeId = created.id;
+        setChats([created]);
       }
       setChatId(activeId);
-
-      const history: Message[] = await fetch(`/api/chats/${activeId}/messages`).then((r) =>
-        r.json(),
-      );
-      setMessages(history);
+      await loadMessagesFor(activeId);
       setConnected(true);
     } catch {
       setConnected(false);
@@ -105,7 +114,7 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
   }
 
   useEffect(() => {
-    void loadMostRecentChat();
+    void init();
   }, []);
 
   async function handleNewChat() {
@@ -116,6 +125,7 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
       );
       setChatId(created.id);
       setMessages([]);
+      await refreshChats();
       setConnected(true);
     } catch {
       setConnected(false);
@@ -124,9 +134,46 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
     }
   }
 
-  function sendMessage(content: string) {
+  async function handleSelectChat(id: string) {
+    if (id === chatId) return;
+    setReady(false);
+    try {
+      await loadMessagesFor(id);
+      setChatId(id);
+      setConnected(true);
+    } catch {
+      setConnected(false);
+    } finally {
+      setReady(true);
+    }
+  }
+
+  async function handleRenameChat(id: string, title: string) {
+    setChats((prev) => prev.map((c) => (c.id === id ? { ...c, title } : c)));
+    await fetch(`/api/chats/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    });
+  }
+
+  async function handleDeleteChat(id: string) {
+    await fetch(`/api/chats/${id}`, { method: 'DELETE' });
+    const remaining = await refreshChats();
+
+    if (id === chatId) {
+      if (remaining.length > 0) {
+        await handleSelectChat(remaining[0].id);
+      } else {
+        await handleNewChat();
+      }
+    }
+  }
+
+  async function sendMessage(content: string) {
     if (!content.trim() || loading || !chatId) return;
 
+    const activeChatId = chatId;
     const userContent = content.trim();
     const userMessage: Message = {
       id: crypto.randomUUID(),
@@ -142,32 +189,33 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
     setMessages((prev) => [...prev, userMessage]);
     setInput('');
 
-    void fetch(`/api/chats/${chatId}/messages`, {
+    await fetch(`/api/chats/${activeChatId}/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ role: 'user', content: userContent }),
     });
 
-    void invoke({ messages: fullMessages }).then(async (result) => {
-      if (result) {
-        const assistantContent = extractContent(result);
-        setMessages((prev) => [
-          ...prev,
-          { id: crypto.randomUUID(), role: 'assistant', content: assistantContent },
-        ]);
+    const result = await invoke({ messages: fullMessages });
+    if (result) {
+      const assistantContent = extractContent(result);
+      setMessages((prev) => [
+        ...prev,
+        { id: crypto.randomUUID(), role: 'assistant', content: assistantContent },
+      ]);
 
-        await fetch(`/api/chats/${chatId}/messages`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ role: 'assistant', content: assistantContent }),
-        });
-      }
-    });
+      await fetch(`/api/chats/${activeChatId}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role: 'assistant', content: assistantContent }),
+      });
+
+      await refreshChats();
+    }
   }
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    sendMessage(input);
+    void sendMessage(input);
   }
 
   return (
@@ -175,9 +223,14 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
       <ChatSidebar
         connected={connected}
         projectName="chat-app-db"
-        examplePrompts={EXAMPLE_PROMPTS}
-        onExampleClick={(prompt) => sendMessage(prompt)}
+        chats={chats}
+        activeChatId={chatId}
+        onSelectChat={(id) => void handleSelectChat(id)}
         onNewChat={() => void handleNewChat()}
+        onRenameChat={(id, title) => void handleRenameChat(id, title)}
+        onDeleteChat={(id) => void handleDeleteChat(id)}
+        examplePrompts={EXAMPLE_PROMPTS}
+        onExampleClick={(prompt) => void sendMessage(prompt)}
         disabled={loading || !ready}
         theme={theme}
         onToggleTheme={onToggleTheme}

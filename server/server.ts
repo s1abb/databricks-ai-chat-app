@@ -1,5 +1,35 @@
 import { createApp, server, serving, lakebase } from '@databricks/appkit';
 
+interface TitleContentPart {
+  type?: string;
+  text?: string;
+}
+
+interface TitleChoice {
+  message?: { content?: string | TitleContentPart[] };
+}
+
+interface TitleResponse {
+  choices?: TitleChoice[];
+}
+
+function extractText(data: unknown): string {
+  const wrapper = data as { ok?: boolean; data?: TitleResponse };
+  const resp = (wrapper?.data ?? (data as TitleResponse)) as TitleResponse;
+  const content = resp?.choices?.[0]?.message?.content;
+
+  if (typeof content === 'string') return content;
+
+  if (Array.isArray(content)) {
+    return content
+      .filter((part: TitleContentPart) => part?.type === 'text' || part?.type === 'output_text')
+      .map((part: TitleContentPart) => part?.text ?? '')
+      .join('');
+  }
+
+  return '';
+}
+
 await createApp({
   plugins: [server(), serving(), lakebase()],
   async onPluginsReady(AppKit) {
@@ -22,6 +52,48 @@ await createApp({
       )
     `);
 
+    async function maybeGenerateTitle(chatId: string, userContent: string, assistantContent: string) {
+      const { rows: countRows } = await AppKit.lakebase.query(
+        `SELECT count(*)::int AS count FROM chat.messages WHERE chat_id = $1`,
+        [chatId],
+      );
+      const count = countRows[0]?.count;
+      console.log(`[title-generation] chat ${chatId} message count: ${count}`);
+      if (count !== 2) {
+        console.log('[title-generation] skipping, not the first exchange');
+        return;
+      }
+
+      try {
+        console.log('[title-generation] requesting title from model...');
+        const result = await AppKit.serving().invoke({
+          messages: [
+            {
+              role: 'system',
+              content:
+                'Generate a concise 3-6 word title summarizing this conversation. Respond with only the title text - no quotes, no punctuation at the end, no preamble.',
+            },
+            { role: 'user', content: userContent },
+            { role: 'assistant', content: assistantContent },
+          ],
+        });
+        console.log('[title-generation] raw result:', JSON.stringify(result));
+        const title = extractText(result).trim().replace(/^["']|["']$/g, '').slice(0, 80);
+        console.log(`[title-generation] extracted title: "${title}"`);
+        if (title) {
+          await AppKit.lakebase.query(`UPDATE chat.chats SET title = $1 WHERE id = $2`, [
+            title,
+            chatId,
+          ]);
+          console.log('[title-generation] saved to database');
+        } else {
+          console.log('[title-generation] extracted title was empty, not saving');
+        }
+      } catch (err) {
+        console.error('[title-generation] failed:', err);
+      }
+    }
+
     AppKit.server.extend((app) => {
       app.post('/api/chats', async (_req, res) => {
         const { rows } = await AppKit.lakebase.query(
@@ -35,6 +107,20 @@ await createApp({
           `SELECT id, title, created_at, updated_at FROM chat.chats ORDER BY updated_at DESC`,
         );
         res.json(rows);
+      });
+
+      app.patch('/api/chats/:chatId', async (req, res) => {
+        const { title } = req.body as { title: string };
+        const { rows } = await AppKit.lakebase.query(
+          `UPDATE chat.chats SET title = $1 WHERE id = $2 RETURNING id, title, created_at, updated_at`,
+          [title, req.params.chatId],
+        );
+        res.json(rows[0]);
+      });
+
+      app.delete('/api/chats/:chatId', async (req, res) => {
+        await AppKit.lakebase.query(`DELETE FROM chat.chats WHERE id = $1`, [req.params.chatId]);
+        res.status(204).end();
       });
 
       app.get('/api/chats/:chatId/messages', async (req, res) => {
@@ -54,6 +140,17 @@ await createApp({
         await AppKit.lakebase.query(`UPDATE chat.chats SET updated_at = now() WHERE id = $1`, [
           req.params.chatId,
         ]);
+
+        if (role === 'assistant') {
+          const { rows: priorUser } = await AppKit.lakebase.query(
+            `SELECT content FROM chat.messages WHERE chat_id = $1 AND role = 'user' ORDER BY created_at ASC LIMIT 1`,
+            [req.params.chatId],
+          );
+          if (priorUser[0]) {
+            await maybeGenerateTitle(req.params.chatId, priorUser[0].content, content);
+          }
+        }
+
         res.json(rows[0]);
       });
     });

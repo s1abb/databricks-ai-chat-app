@@ -1,24 +1,72 @@
+import { useEffect, useState } from 'react';
+
+interface ChatSummary {
+  id: string;
+  title: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 interface ChatSidebarProps {
   connected: boolean;
   projectName: string;
+  chats: ChatSummary[];
+  activeChatId: string | null;
+  onSelectChat: (id: string) => void;
+  onNewChat: () => void;
+  onRenameChat: (id: string, title: string) => void;
+  onDeleteChat: (id: string) => void;
   examplePrompts: string[];
   onExampleClick: (prompt: string) => void;
-  onNewChat: () => void;
   disabled?: boolean;
   theme: 'light' | 'dark';
   onToggleTheme: () => void;
 }
 
+function chatLabel(chat: ChatSummary): string {
+  return chat.title?.trim() || 'New conversation';
+}
+
 export function ChatSidebar({
   connected,
   projectName,
+  chats,
+  activeChatId,
+  onSelectChat,
+  onNewChat,
+  onRenameChat,
+  onDeleteChat,
   examplePrompts,
   onExampleClick,
-  onNewChat,
   disabled,
   theme,
   onToggleTheme,
 }: ChatSidebarProps) {
+  const [openMenuFor, setOpenMenuFor] = useState<string | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editValue, setEditValue] = useState('');
+
+  useEffect(() => {
+    if (!openMenuFor) return;
+    function closeMenu() {
+      setOpenMenuFor(null);
+    }
+    window.addEventListener('click', closeMenu);
+    return () => window.removeEventListener('click', closeMenu);
+  }, [openMenuFor]);
+
+  function startRename(chat: ChatSummary) {
+    setEditingId(chat.id);
+    setEditValue(chatLabel(chat));
+    setOpenMenuFor(null);
+  }
+
+  function commitRename(id: string) {
+    const trimmed = editValue.trim();
+    if (trimmed) onRenameChat(id, trimmed);
+    setEditingId(null);
+  }
+
   return (
     <aside className="w-72 shrink-0 border-r border-gray-200 dark:border-neutral-800 bg-gray-50 dark:bg-neutral-950 flex flex-col h-full">
       <div className="px-4 py-4 flex items-center gap-2">
@@ -106,23 +154,118 @@ export function ChatSidebar({
         </div>
       </div>
 
-      <div className="px-3 mt-5 overflow-y-auto">
-        <div className="text-[11px] font-semibold tracking-wide text-gray-400 dark:text-neutral-500 px-1 mb-1">
-          QUESTIONS
-        </div>
-        <div className="flex flex-col gap-0.5">
-          {examplePrompts.map((prompt) => (
-            <button
-              key={prompt}
-              type="button"
-              onClick={() => onExampleClick(prompt)}
-              disabled={disabled}
-              className="text-left text-sm text-gray-700 dark:text-neutral-300 rounded-lg px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-800 transition-colors disabled:opacity-50"
-            >
-              {prompt}
-            </button>
-          ))}
-        </div>
+      <div className="px-3 mt-5 flex-1 overflow-y-auto">
+        {chats.length === 0 ? (
+          <>
+            <div className="text-[11px] font-semibold tracking-wide text-gray-400 dark:text-neutral-500 px-1 mb-1">
+              QUESTIONS
+            </div>
+            <div className="flex flex-col gap-0.5">
+              {examplePrompts.map((prompt) => (
+                <button
+                  key={prompt}
+                  type="button"
+                  onClick={() => onExampleClick(prompt)}
+                  disabled={disabled}
+                  className="text-left text-sm text-gray-700 dark:text-neutral-300 rounded-lg px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-800 transition-colors disabled:opacity-50"
+                >
+                  {prompt}
+                </button>
+              ))}
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="text-[11px] font-semibold tracking-wide text-gray-400 dark:text-neutral-500 px-1 mb-1">
+              CONVERSATIONS
+            </div>
+            <div className="flex flex-col gap-0.5">
+              {chats.map((chat) => {
+                const isActive = chat.id === activeChatId;
+                const isEditing = editingId === chat.id;
+                return (
+                  <div key={chat.id} className="relative group">
+                    {isEditing ? (
+                      <input
+                        autoFocus
+                        value={editValue}
+                        onChange={(e) => setEditValue(e.target.value)}
+                        onBlur={() => commitRename(chat.id)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') commitRename(chat.id);
+                          if (e.key === 'Escape') setEditingId(null);
+                        }}
+                        style={{ colorScheme: theme }}
+                        className="w-full text-sm rounded-lg px-3 py-2 border border-gray-300 dark:border-neutral-600 bg-white dark:bg-neutral-800 text-gray-900 dark:text-neutral-100 outline-none"
+                      />
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => onSelectChat(chat.id)}
+                        disabled={disabled}
+                        className={`w-full flex items-center text-left text-sm rounded-lg pl-3 pr-8 py-2 truncate transition-colors disabled:opacity-50 ${
+                          isActive
+                            ? 'bg-gray-200 dark:bg-neutral-800 text-gray-900 dark:text-neutral-100'
+                            : 'text-gray-700 dark:text-neutral-300 hover:bg-gray-100 dark:hover:bg-neutral-800'
+                        }`}
+                      >
+                        <span className="truncate">{chatLabel(chat)}</span>
+                      </button>
+                    )}
+
+                    {!isEditing && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setOpenMenuFor(openMenuFor === chat.id ? null : chat.id);
+                        }}
+                        className="absolute right-1 top-1/2 -translate-y-1/2 h-6 w-6 flex items-center justify-center rounded-md text-gray-400 dark:text-neutral-500 hover:bg-gray-200 dark:hover:bg-neutral-700 opacity-0 group-hover:opacity-100 transition-opacity"
+                        aria-label="Chat options"
+                      >
+                        <svg
+                          xmlns="http://www.w3.org/2000/svg"
+                          viewBox="0 0 24 24"
+                          fill="currentColor"
+                          className="h-4 w-4"
+                        >
+                          <circle cx="5" cy="12" r="1.5" />
+                          <circle cx="12" cy="12" r="1.5" />
+                          <circle cx="19" cy="12" r="1.5" />
+                        </svg>
+                      </button>
+                    )}
+
+                    {openMenuFor === chat.id && (
+                      <div
+                        onClick={(e) => e.stopPropagation()}
+                        className="absolute right-0 top-full mt-1 z-10 w-32 rounded-lg border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 shadow-lg py-1"
+                      >
+                        <button
+                          type="button"
+                          onClick={() => startRename(chat)}
+                          className="w-full text-left text-sm px-3 py-1.5 text-gray-700 dark:text-neutral-300 hover:bg-gray-100 dark:hover:bg-neutral-700"
+                        >
+                          Rename
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setOpenMenuFor(null);
+                            onDeleteChat(chat.id);
+                          }}
+                          className="w-full text-left text-sm px-3 py-1.5 text-red-600 dark:text-red-400 hover:bg-gray-100 dark:hover:bg-neutral-700"
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
       </div>
 
       <div className="mt-auto px-4 py-3 text-xs text-gray-400 dark:text-neutral-500 border-t border-gray-200 dark:border-neutral-800">
