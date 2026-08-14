@@ -1,5 +1,9 @@
 import { useServingInvoke } from '@databricks/appkit-ui/react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import rehypeRaw from 'rehype-raw';
+import { ChatSidebar } from '../../components/ChatSidebar';
 
 interface ChatContentPart {
   type?: string;
@@ -45,17 +49,36 @@ interface ChatSummary {
   updated_at: string;
 }
 
-export function ServingPage() {
+interface ServingPageProps {
+  theme: 'light' | 'dark';
+  onToggleTheme: () => void;
+}
+
+const EXAMPLE_PROMPTS = [
+  'What can you help me with?',
+  'How does this app store my conversation?',
+  'What model are you running on?',
+  'Summarize what Databricks Lakebase is',
+];
+
+export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatId, setChatId] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
+  const [connected, setConnected] = useState(false);
 
   const { invoke, loading, error } = useServingInvoke({ messages: [] });
 
-  // On mount: resume the most recent chat, or create a new one.
+  const bottomRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
-    async function init() {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, loading]);
+
+  async function loadMostRecentChat() {
+    setReady(false);
+    try {
       const chats: ChatSummary[] = await fetch('/api/chats').then((r) => r.json());
 
       let activeId: string;
@@ -73,17 +96,38 @@ export function ServingPage() {
         r.json(),
       );
       setMessages(history);
+      setConnected(true);
+    } catch {
+      setConnected(false);
+    } finally {
       setReady(true);
     }
+  }
 
-    void init();
+  useEffect(() => {
+    void loadMostRecentChat();
   }, []);
 
-  function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    if (!input.trim() || loading || !chatId) return;
+  async function handleNewChat() {
+    setReady(false);
+    try {
+      const created: ChatSummary = await fetch('/api/chats', { method: 'POST' }).then((r) =>
+        r.json(),
+      );
+      setChatId(created.id);
+      setMessages([]);
+      setConnected(true);
+    } catch {
+      setConnected(false);
+    } finally {
+      setReady(true);
+    }
+  }
 
-    const userContent = input.trim();
+  function sendMessage(content: string) {
+    if (!content.trim() || loading || !chatId) return;
+
+    const userContent = content.trim();
     const userMessage: Message = {
       id: crypto.randomUUID(),
       role: 'user',
@@ -91,14 +135,13 @@ export function ServingPage() {
     };
 
     const fullMessages = [
-      ...messages.map(({ role, content }) => ({ role, content })),
+      ...messages.map(({ role, content: c }) => ({ role, content: c })),
       { role: 'user' as const, content: userContent },
     ];
 
     setMessages((prev) => [...prev, userMessage]);
     setInput('');
 
-    // Persist the user turn (fire-and-forget is fine; UI already updated optimistically).
     void fetch(`/api/chats/${chatId}/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -113,7 +156,6 @@ export function ServingPage() {
           { id: crypto.randomUUID(), role: 'assistant', content: assistantContent },
         ]);
 
-        // Persist the assistant turn.
         await fetch(`/api/chats/${chatId}/messages`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -123,70 +165,107 @@ export function ServingPage() {
     });
   }
 
+  function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    sendMessage(input);
+  }
+
   return (
-    <div className="space-y-6 w-full max-w-4xl mx-auto">
-      <div>
-        <h2 className="text-2xl font-bold text-foreground">Model Serving</h2>
-        <p className="text-sm text-muted-foreground mt-1">
-          Chat with a Databricks Model Serving endpoint.
-        </p>
-      </div>
+    <div className="h-screen w-full flex bg-white dark:bg-neutral-900">
+      <ChatSidebar
+        connected={connected}
+        projectName="chat-app-db"
+        examplePrompts={EXAMPLE_PROMPTS}
+        onExampleClick={(prompt) => sendMessage(prompt)}
+        onNewChat={() => void handleNewChat()}
+        disabled={loading || !ready}
+        theme={theme}
+        onToggleTheme={onToggleTheme}
+      />
 
-      <div className="border rounded-lg flex flex-col h-[min(600px,70vh)]">
-        <div className="flex-1 overflow-y-auto p-4 space-y-4">
-          {!ready && (
-            <p className="text-sm text-muted-foreground">Loading conversation...</p>
-          )}
+      <div className="flex-1 flex flex-col min-w-0">
+        <div className="flex-1 overflow-y-auto px-6 py-8">
+          <div className="max-w-3xl mx-auto space-y-6">
+            {!ready && (
+              <p className="text-sm text-gray-400 dark:text-neutral-500">
+                Loading conversation...
+              </p>
+            )}
 
-          {messages.map((msg) => (
-            <div
-              key={msg.id}
-              className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
-            >
-              <div
-                className={`max-w-[80%] rounded-lg px-4 py-2 ${
-                  msg.role === 'user'
-                    ? 'bg-primary text-primary-foreground'
-                    : 'bg-muted'
-                }`}
-              >
-                <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
+            {messages.map((msg) =>
+              msg.role === 'user' ? (
+                <div key={msg.id} className="flex justify-end">
+                  <div className="max-w-[80%] rounded-2xl bg-gray-100 dark:bg-neutral-800 px-4 py-2">
+                    <p className="text-sm whitespace-pre-wrap text-gray-700 dark:text-neutral-200">
+                      {msg.content}
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <div key={msg.id} className="flex justify-start">
+                  <div className="max-w-[80%] text-sm text-gray-700 dark:text-neutral-200 [&_p]:my-2 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0 [&_ul]:list-disc [&_ul]:pl-5 [&_ul]:my-2 [&_ol]:list-decimal [&_ol]:pl-5 [&_ol]:my-2 [&_li]:my-0.5 [&_strong]:font-semibold [&_code]:bg-gray-100 dark:[&_code]:bg-neutral-800 [&_code]:rounded [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-xs [&_a]:text-blue-600 dark:[&_a]:text-blue-400 [&_a]:underline [&_table]:my-3 [&_table]:border-collapse [&_table]:w-full [&_th]:border [&_th]:border-gray-200 dark:[&_th]:border-neutral-700 [&_th]:bg-gray-50 dark:[&_th]:bg-neutral-800 [&_th]:px-3 [&_th]:py-1.5 [&_th]:text-left [&_th]:font-semibold [&_td]:border [&_td]:border-gray-200 dark:[&_td]:border-neutral-700 [&_td]:px-3 [&_td]:py-1.5 [&_table]:text-xs">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeRaw]}>
+                      {msg.content}
+                    </ReactMarkdown>
+                  </div>
+                </div>
+              ),
+            )}
+
+            {loading && (
+              <p className="text-sm text-gray-400 dark:text-neutral-500">Generating response</p>
+            )}
+
+            {error && (
+              <div className="text-destructive text-sm p-2 bg-destructive/10 rounded">
+                Error: {error}
               </div>
-            </div>
-          ))}
+            )}
 
-          {loading && (
-            <div className="flex justify-start">
-              <div className="max-w-[80%] rounded-lg px-4 py-2 bg-muted">
-                <p className="text-sm whitespace-pre-wrap">...</p>
-              </div>
-            </div>
-          )}
-
-          {error && (
-            <div className="text-destructive text-sm p-2 bg-destructive/10 rounded">
-              Error: {error}
-            </div>
-          )}
+            <div ref={bottomRef} />
+          </div>
         </div>
 
-        <form onSubmit={handleSubmit} className="border-t p-4 flex gap-2">
-          <input
-            type="text"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder="Send a message..."
-            className="flex-1 rounded-md border px-3 py-2 text-sm bg-background"
-            disabled={loading || !ready}
-          />
-          <button
-            type="submit"
-            disabled={loading || !ready || !input.trim()}
-            className="rounded-md bg-primary text-primary-foreground px-4 py-2 text-sm font-medium disabled:opacity-50"
-          >
-            {loading ? 'Loading...' : 'Send'}
-          </button>
-        </form>
+        <div className="px-6 pb-6">
+          <div className="max-w-3xl mx-auto">
+            <form
+              onSubmit={handleSubmit}
+              className="flex items-center gap-2 rounded-2xl border border-gray-200 dark:border-neutral-700 shadow-sm px-4 py-3 bg-white dark:bg-neutral-900"
+            >
+              <input
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder="Ask a question..."
+                className="flex-1 text-sm text-gray-900 dark:text-neutral-100 placeholder:text-gray-400 dark:placeholder:text-neutral-500 bg-transparent border-0 outline-none ring-0 focus:outline-none focus:ring-0 appearance-none"
+                style={{ colorScheme: theme }}
+                disabled={loading || !ready}
+              />
+              <button
+                type="submit"
+                disabled={loading || !ready || !input.trim()}
+                className="h-9 w-9 shrink-0 rounded-full bg-black text-white dark:bg-white dark:text-neutral-900 flex items-center justify-center disabled:opacity-40 transition-opacity"
+              >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="h-4 w-4"
+                >
+                  <path d="M12 19V5" />
+                  <path d="m5 12 7-7 7 7" />
+                </svg>
+              </button>
+            </form>
+            <p className="text-center text-xs text-gray-400 dark:text-neutral-500 mt-2">
+              Always review the accuracy of responses.
+            </p>
+          </div>
+        </div>
       </div>
     </div>
   );
