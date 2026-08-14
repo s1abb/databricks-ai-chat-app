@@ -57,15 +57,9 @@ await createApp({
         `SELECT count(*)::int AS count FROM chat.messages WHERE chat_id = $1`,
         [chatId],
       );
-      const count = countRows[0]?.count;
-      console.log(`[title-generation] chat ${chatId} message count: ${count}`);
-      if (count !== 2) {
-        console.log('[title-generation] skipping, not the first exchange');
-        return;
-      }
+      if (countRows[0]?.count !== 2) return;
 
       try {
-        console.log('[title-generation] requesting title from model...');
         const result = await AppKit.serving().invoke({
           messages: [
             {
@@ -77,17 +71,12 @@ await createApp({
             { role: 'assistant', content: assistantContent },
           ],
         });
-        console.log('[title-generation] raw result:', JSON.stringify(result));
         const title = extractText(result).trim().replace(/^["']|["']$/g, '').slice(0, 80);
-        console.log(`[title-generation] extracted title: "${title}"`);
         if (title) {
           await AppKit.lakebase.query(`UPDATE chat.chats SET title = $1 WHERE id = $2`, [
             title,
             chatId,
           ]);
-          console.log('[title-generation] saved to database');
-        } else {
-          console.log('[title-generation] extracted title was empty, not saving');
         }
       } catch (err) {
         console.error('[title-generation] failed:', err);

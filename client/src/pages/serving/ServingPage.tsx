@@ -54,13 +54,6 @@ interface ServingPageProps {
   onToggleTheme: () => void;
 }
 
-const EXAMPLE_PROMPTS = [
-  'What can you help me with?',
-  'How does this app store my conversation?',
-  'What model are you running on?',
-  'Summarize what Databricks Lakebase is',
-];
-
 export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
@@ -158,15 +151,26 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
   }
 
   async function handleDeleteChat(id: string) {
+    const isActive = id === chatId;
+    const isLastChat = chats.length === 1 && chats[0]?.id === id;
+
+    if (isActive && isLastChat) {
+      // Create the replacement first so the list is never empty on screen.
+      const created: ChatSummary = await fetch('/api/chats', { method: 'POST' }).then((r) =>
+        r.json(),
+      );
+      setChatId(created.id);
+      setMessages([]);
+      await fetch(`/api/chats/${id}`, { method: 'DELETE' });
+      await refreshChats();
+      return;
+    }
+
     await fetch(`/api/chats/${id}`, { method: 'DELETE' });
     const remaining = await refreshChats();
 
-    if (id === chatId) {
-      if (remaining.length > 0) {
-        await handleSelectChat(remaining[0].id);
-      } else {
-        await handleNewChat();
-      }
+    if (isActive && remaining.length > 0) {
+      await handleSelectChat(remaining[0].id);
     }
   }
 
@@ -229,8 +233,6 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
         onNewChat={() => void handleNewChat()}
         onRenameChat={(id, title) => void handleRenameChat(id, title)}
         onDeleteChat={(id) => void handleDeleteChat(id)}
-        examplePrompts={EXAMPLE_PROMPTS}
-        onExampleClick={(prompt) => void sendMessage(prompt)}
         disabled={loading || !ready}
         theme={theme}
         onToggleTheme={onToggleTheme}
