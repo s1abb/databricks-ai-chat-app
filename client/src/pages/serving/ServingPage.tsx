@@ -45,6 +45,7 @@ interface Message {
 interface ChatSummary {
   id: string;
   title: string | null;
+  last_model: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -54,6 +55,91 @@ interface ServingPageProps {
   onToggleTheme: () => void;
 }
 
+const MODEL_OPTIONS = [
+  { alias: 'gpt_oss_120b', label: 'GPT OSS 120B' },
+  { alias: 'llama_3_3_70b', label: 'Llama 3.3 70B' },
+  { alias: 'qwen35_122b', label: 'Qwen3.5 122B' },
+] as const;
+
+type ModelAlias = (typeof MODEL_OPTIONS)[number]['alias'];
+
+function isModelAlias(value: string | null | undefined): value is ModelAlias {
+  return MODEL_OPTIONS.some((m) => m.alias === value);
+}
+
+interface CodeRendererProps {
+  className?: string;
+  children?: React.ReactNode;
+}
+
+function CodeRenderer({ className, children }: CodeRendererProps) {
+  const [copied, setCopied] = useState(false);
+  const match = /language-(\w+)/.exec(className || '');
+
+  if (!match) {
+    return (
+      <code className="bg-gray-100 dark:bg-neutral-800 rounded px-1 py-0.5 text-xs font-mono">
+        {children}
+      </code>
+    );
+  }
+
+  const codeText = String(children).replace(/\n$/, '');
+
+  function handleCopy() {
+    void navigator.clipboard.writeText(codeText).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  }
+
+  return (
+    <div className="my-3 rounded-xl border border-neutral-800 bg-neutral-900 overflow-hidden">
+      <div className="flex items-center justify-between px-4 py-2 border-b border-neutral-800">
+        <span className="text-xs text-neutral-500 font-mono lowercase">{match[1]}</span>
+        <button
+          type="button"
+          onClick={handleCopy}
+          className="h-6 w-6 flex items-center justify-center rounded text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition-colors"
+          aria-label="Copy code"
+        >
+          {copied ? (
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className="h-4 w-4"
+            >
+              <path d="M20 6 9 17l-5-5" />
+            </svg>
+          ) : (
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className="h-4 w-4"
+            >
+              <rect x="9" y="9" width="13" height="13" rx="2" />
+              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+            </svg>
+          )}
+        </button>
+      </div>
+      <pre className="px-4 py-3 overflow-x-auto">
+        <code className="text-sm leading-relaxed text-neutral-200 font-mono">{codeText}</code>
+      </pre>
+    </div>
+  );
+}
+
 export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
@@ -61,14 +147,28 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
   const [chatId, setChatId] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
   const [connected, setConnected] = useState(false);
+  const [selectedModel, setSelectedModel] = useState<ModelAlias>(MODEL_OPTIONS[0].alias);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
 
-  const { invoke, loading, error } = useServingInvoke({ messages: [] });
+  const { invoke, loading, error } = useServingInvoke(
+    { messages: [] },
+    { alias: selectedModel },
+  );
 
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, loading]);
+
+  useEffect(() => {
+    if (!modelMenuOpen) return;
+    function closeMenu() {
+      setModelMenuOpen(false);
+    }
+    window.addEventListener('click', closeMenu);
+    return () => window.removeEventListener('click', closeMenu);
+  }, [modelMenuOpen]);
 
   async function refreshChats(): Promise<ChatSummary[]> {
     const list: ChatSummary[] = await fetch('/api/chats').then((r) => r.json());
@@ -86,18 +186,16 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
     try {
       const list = await refreshChats();
 
-      let activeId: string;
+      let active: ChatSummary;
       if (list.length > 0) {
-        activeId = list[0].id;
+        active = list[0];
       } else {
-        const created: ChatSummary = await fetch('/api/chats', { method: 'POST' }).then((r) =>
-          r.json(),
-        );
-        activeId = created.id;
-        setChats([created]);
+        active = await fetch('/api/chats', { method: 'POST' }).then((r) => r.json());
+        setChats([active]);
       }
-      setChatId(activeId);
-      await loadMessagesFor(activeId);
+      setChatId(active.id);
+      setSelectedModel(isModelAlias(active.last_model) ? active.last_model : MODEL_OPTIONS[0].alias);
+      await loadMessagesFor(active.id);
       setConnected(true);
     } catch {
       setConnected(false);
@@ -118,6 +216,7 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
       );
       setChatId(created.id);
       setMessages([]);
+      setSelectedModel(MODEL_OPTIONS[0].alias);
       await refreshChats();
       setConnected(true);
     } catch {
@@ -133,6 +232,10 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
     try {
       await loadMessagesFor(id);
       setChatId(id);
+      const target = chats.find((c) => c.id === id);
+      setSelectedModel(
+        isModelAlias(target?.last_model) ? target!.last_model! as ModelAlias : MODEL_OPTIONS[0].alias,
+      );
       setConnected(true);
     } catch {
       setConnected(false);
@@ -155,12 +258,12 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
     const isLastChat = chats.length === 1 && chats[0]?.id === id;
 
     if (isActive && isLastChat) {
-      // Create the replacement first so the list is never empty on screen.
       const created: ChatSummary = await fetch('/api/chats', { method: 'POST' }).then((r) =>
         r.json(),
       );
       setChatId(created.id);
       setMessages([]);
+      setSelectedModel(MODEL_OPTIONS[0].alias);
       await fetch(`/api/chats/${id}`, { method: 'DELETE' });
       await refreshChats();
       return;
@@ -196,7 +299,7 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
     await fetch(`/api/chats/${activeChatId}/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ role: 'user', content: userContent }),
+      body: JSON.stringify({ role: 'user', content: userContent, model: selectedModel }),
     });
 
     const result = await invoke({ messages: fullMessages });
@@ -221,6 +324,9 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
     e.preventDefault();
     void sendMessage(input);
   }
+
+  const currentModelLabel =
+    MODEL_OPTIONS.find((m) => m.alias === selectedModel)?.label ?? selectedModel;
 
   return (
     <div className="h-screen w-full flex bg-white dark:bg-neutral-900">
@@ -258,8 +364,12 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
                 </div>
               ) : (
                 <div key={msg.id} className="flex justify-start">
-                  <div className="max-w-[80%] text-sm text-gray-700 dark:text-neutral-200 [&_p]:my-2 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0 [&_ul]:list-disc [&_ul]:pl-5 [&_ul]:my-2 [&_ol]:list-decimal [&_ol]:pl-5 [&_ol]:my-2 [&_li]:my-0.5 [&_strong]:font-semibold [&_code]:bg-gray-100 dark:[&_code]:bg-neutral-800 [&_code]:rounded [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-xs [&_a]:text-blue-600 dark:[&_a]:text-blue-400 [&_a]:underline [&_table]:my-3 [&_table]:border-collapse [&_table]:w-full [&_th]:border [&_th]:border-gray-200 dark:[&_th]:border-neutral-700 [&_th]:bg-gray-50 dark:[&_th]:bg-neutral-800 [&_th]:px-3 [&_th]:py-1.5 [&_th]:text-left [&_th]:font-semibold [&_td]:border [&_td]:border-gray-200 dark:[&_td]:border-neutral-700 [&_td]:px-3 [&_td]:py-1.5 [&_table]:text-xs">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeRaw]}>
+                  <div className="max-w-[80%] text-sm text-gray-700 dark:text-neutral-200 [&_p]:my-2 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0 [&_ul]:list-disc [&_ul]:pl-5 [&_ul]:my-2 [&_ol]:list-decimal [&_ol]:pl-5 [&_ol]:my-2 [&_li]:my-0.5 [&_strong]:font-semibold [&_a]:text-blue-600 dark:[&_a]:text-blue-400 [&_a]:underline [&_table]:my-3 [&_table]:border-collapse [&_table]:w-full [&_th]:border [&_th]:border-gray-200 dark:[&_th]:border-neutral-700 [&_th]:bg-gray-50 dark:[&_th]:bg-neutral-800 [&_th]:px-3 [&_th]:py-1.5 [&_th]:text-left [&_th]:font-semibold [&_td]:border [&_td]:border-gray-200 dark:[&_td]:border-neutral-700 [&_td]:px-3 [&_td]:py-1.5 [&_table]:text-xs">
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm]}
+                      rehypePlugins={[rehypeRaw]}
+                      components={{ code: CodeRenderer }}
+                    >
                       {msg.content}
                     </ReactMarkdown>
                   </div>
@@ -281,7 +391,7 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
           </div>
         </div>
 
-        <div className="px-6 pb-6">
+        <div className="px-6 pt-4 pb-6 border-t border-gray-100 dark:border-neutral-800">
           <div className="max-w-3xl mx-auto">
             <form
               onSubmit={handleSubmit}
@@ -296,6 +406,58 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
                 style={{ colorScheme: theme }}
                 disabled={loading || !ready}
               />
+
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setModelMenuOpen((prev) => !prev);
+                  }}
+                  disabled={loading || !ready}
+                  className="flex items-center gap-1 text-xs text-gray-500 dark:text-neutral-400 hover:bg-gray-100 dark:hover:bg-neutral-800 rounded-md px-2 py-1 transition-colors disabled:opacity-50"
+                >
+                  {currentModelLabel}
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    className="h-3 w-3"
+                  >
+                    <path d="m6 9 6 6 6-6" />
+                  </svg>
+                </button>
+
+                {modelMenuOpen && (
+                  <div
+                    onClick={(e) => e.stopPropagation()}
+                    className="absolute bottom-full right-0 mb-2 w-40 rounded-lg border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 shadow-lg py-1 z-10"
+                  >
+                    {MODEL_OPTIONS.map((option) => (
+                      <button
+                        key={option.alias}
+                        type="button"
+                        onClick={() => {
+                          setSelectedModel(option.alias);
+                          setModelMenuOpen(false);
+                        }}
+                        className={`w-full text-left text-sm px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700 ${
+                          option.alias === selectedModel
+                            ? 'text-gray-900 dark:text-neutral-100 font-medium'
+                            : 'text-gray-600 dark:text-neutral-400'
+                        }`}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
               <button
                 type="submit"
                 disabled={loading || !ready || !input.trim()}
@@ -316,9 +478,6 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
                 </svg>
               </button>
             </form>
-            <p className="text-center text-xs text-gray-400 dark:text-neutral-500 mt-2">
-              Always review the accuracy of responses.
-            </p>
           </div>
         </div>
       </div>

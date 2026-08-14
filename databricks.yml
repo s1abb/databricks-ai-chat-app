@@ -4,11 +4,15 @@ bundle:
 variables:
   serving_endpoint_name:
     description: Serving endpoint name
+  model_llama_endpoint_name:
+    description: Llama 3.3 70B serving endpoint name
+  model_qwen_endpoint_name:
+    description: Qwen3.5 122B serving endpoint name
   postgres_branch:
     description: Lakebase Postgres branch
   postgres_database:
     description: Lakebase Postgres database
-    
+
 resources:
   apps:
     app:
@@ -24,6 +28,14 @@ resources:
           serving_endpoint:
             name: ${var.serving_endpoint_name}
             permission: CAN_QUERY
+        - name: serving-endpoint-llama
+          serving_endpoint:
+            name: ${var.model_llama_endpoint_name}
+            permission: CAN_QUERY
+        - name: serving-endpoint-qwen
+          serving_endpoint:
+            name: ${var.model_qwen_endpoint_name}
+            permission: CAN_QUERY
         - name: postgres
           postgres:
             branch: ${var.postgres_branch}
@@ -38,5 +50,7 @@ targets:
 
     variables:
       serving_endpoint_name: databricks-gpt-oss-120b
+      model_llama_endpoint_name: databricks-meta-llama-3-3-70b-instruct
+      model_qwen_endpoint_name: databricks-qwen35-122b-a10b
       postgres_branch: projects/chat-app-db/branches/production
       postgres_database: projects/chat-app-db/branches/production/databases/databricks-postgres

@@ -23,7 +23,7 @@
     "postinstall": "npm run typegen",
     "prebuild": "npm run sync && npm run typegen",
     "predev": "npm run sync && npm run typegen",
-    "sync": "appkit plugin sync --write --silent",
+    "sync": "appkit plugin sync --write --silent && node scripts/fix-serving-manifest.mjs",
     "typegen": "appkit generate-types",
     "setup": "appkit setup --write"
   },

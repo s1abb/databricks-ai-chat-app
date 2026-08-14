@@ -31,13 +31,24 @@ function extractText(data: unknown): string {
 }
 
 await createApp({
-  plugins: [server(), serving(), lakebase()],
+  plugins: [
+    server(),
+    serving({
+      endpoints: {
+        gpt_oss_120b: { env: 'MODEL_GPT_OSS_ENDPOINT_NAME' },
+        llama_3_3_70b: { env: 'MODEL_LLAMA_ENDPOINT_NAME' },
+        qwen35_122b: { env: 'MODEL_QWEN_ENDPOINT_NAME' },
+      },
+    }),
+    lakebase(),
+  ],
   async onPluginsReady(AppKit) {
     await AppKit.lakebase.query(`CREATE SCHEMA IF NOT EXISTS chat`);
     await AppKit.lakebase.query(`
       CREATE TABLE IF NOT EXISTS chat.chats (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         title TEXT,
+        last_model TEXT,
         created_at TIMESTAMPTZ DEFAULT now(),
         updated_at TIMESTAMPTZ DEFAULT now()
       )
@@ -60,15 +71,12 @@ await createApp({
       if (countRows[0]?.count !== 2) return;
 
       try {
-        const result = await AppKit.serving().invoke({
+        const result = await AppKit.serving('gpt_oss_120b').invoke({
           messages: [
             {
-              role: 'system',
-              content:
-                'Generate a concise 3-6 word title summarizing this conversation. Respond with only the title text - no quotes, no punctuation at the end, no preamble.',
+              role: 'user',
+              content: `Generate a concise 3-6 word title summarizing the conversation below. Respond with only the title text - no quotes, no punctuation at the end, no preamble.\n\nUser: ${userContent}\nAssistant: ${assistantContent}`,
             },
-            { role: 'user', content: userContent },
-            { role: 'assistant', content: assistantContent },
           ],
         });
         const title = extractText(result).trim().replace(/^["']|["']$/g, '').slice(0, 80);
@@ -84,16 +92,21 @@ await createApp({
     }
 
     AppKit.server.extend((app) => {
+      app.post('/api/admin/reset-chat-schema', async (_req, res) => {
+        await AppKit.lakebase.query(`DROP SCHEMA IF EXISTS chat CASCADE`);
+        res.json({ ok: true, message: 'Schema dropped. Restart the app to recreate it.' });
+      });
+
       app.post('/api/chats', async (_req, res) => {
         const { rows } = await AppKit.lakebase.query(
-          `INSERT INTO chat.chats DEFAULT VALUES RETURNING id, title, created_at, updated_at`,
+          `INSERT INTO chat.chats DEFAULT VALUES RETURNING id, title, last_model, created_at, updated_at`,
         );
         res.json(rows[0]);
       });
 
       app.get('/api/chats', async (_req, res) => {
         const { rows } = await AppKit.lakebase.query(
-          `SELECT id, title, created_at, updated_at FROM chat.chats ORDER BY updated_at DESC`,
+          `SELECT id, title, last_model, created_at, updated_at FROM chat.chats ORDER BY updated_at DESC`,
         );
         res.json(rows);
       });
@@ -101,7 +114,7 @@ await createApp({
       app.patch('/api/chats/:chatId', async (req, res) => {
         const { title } = req.body as { title: string };
         const { rows } = await AppKit.lakebase.query(
-          `UPDATE chat.chats SET title = $1 WHERE id = $2 RETURNING id, title, created_at, updated_at`,
+          `UPDATE chat.chats SET title = $1 WHERE id = $2 RETURNING id, title, last_model, created_at, updated_at`,
           [title, req.params.chatId],
         );
         res.json(rows[0]);
@@ -121,14 +134,25 @@ await createApp({
       });
 
       app.post('/api/chats/:chatId/messages', async (req, res) => {
-        const { role, content } = req.body as { role: 'user' | 'assistant'; content: string };
+        const { role, content, model } = req.body as {
+          role: 'user' | 'assistant';
+          content: string;
+          model?: string;
+        };
         const { rows } = await AppKit.lakebase.query(
           `INSERT INTO chat.messages (chat_id, role, content) VALUES ($1, $2, $3) RETURNING id, role, content, created_at`,
           [req.params.chatId, role, content],
         );
-        await AppKit.lakebase.query(`UPDATE chat.chats SET updated_at = now() WHERE id = $1`, [
-          req.params.chatId,
-        ]);
+        if (model) {
+          await AppKit.lakebase.query(
+            `UPDATE chat.chats SET updated_at = now(), last_model = $2 WHERE id = $1`,
+            [req.params.chatId, model],
+          );
+        } else {
+          await AppKit.lakebase.query(`UPDATE chat.chats SET updated_at = now() WHERE id = $1`, [
+            req.params.chatId,
+          ]);
+        }
 
         if (role === 'assistant') {
           const { rows: priorUser } = await AppKit.lakebase.query(
