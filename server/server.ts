@@ -36,11 +36,9 @@ function extractText(data: unknown): string {
 }
 
 function parseJsonLoose(raw: string): unknown {
-  // Strip markdown code fences if the model wrapped its JSON in ```json ... ```
   const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
   const candidate = fenced ? fenced[1] : raw;
 
-  // Fall back to the first {...} block if there's still surrounding prose.
   const start = candidate.indexOf('{');
   const end = candidate.lastIndexOf('}');
   const jsonSlice = start !== -1 && end !== -1 ? candidate.slice(start, end + 1) : candidate;
@@ -118,8 +116,9 @@ async function extractTextFromUpload(filename: string, buffer: Buffer): Promise<
 }
 
 interface RetrievedSource {
+  kind: 'chunk' | 'entity' | 'relationship';
   chunkId: string;
-  documentId: string;
+  documentId: string | null;
   filename: string;
   snippet: string;
   similarity: number;
@@ -411,6 +410,15 @@ ${chunkText}`,
       }
     }
 
+    async function representativeFilename(chunkIds: string[]): Promise<string | null> {
+      if (!chunkIds || chunkIds.length === 0) return null;
+      const { rows } = await AppKit.lakebase.query(
+        `SELECT d.filename FROM rag.chunks c JOIN rag.documents d ON d.id = c.document_id WHERE c.id = $1 LIMIT 1`,
+        [chunkIds[0]],
+      );
+      return rows[0]?.filename ?? null;
+    }
+
     async function retrieveContext(
       query: string,
       topK = 5,
@@ -420,8 +428,9 @@ ${chunkText}`,
       if (!queryEmbedding) {
         return { context: '', sources: [] };
       }
+      const vecLiteral = toVectorLiteral(queryEmbedding);
 
-      const { rows } = await AppKit.lakebase.query(
+      const { rows: chunkRows } = await AppKit.lakebase.query(
         `
           SELECT c.id AS chunk_id, c.content, d.id AS document_id, d.filename,
                  1 - (c.embedding <=> $1::vector) AS similarity
@@ -430,31 +439,104 @@ ${chunkText}`,
           ORDER BY c.embedding <=> $1::vector
           LIMIT $2
         `,
-        [toVectorLiteral(queryEmbedding), topK],
+        [vecLiteral, topK],
       );
 
-      const sources: RetrievedSource[] = rows.map(
-        (row: {
-          chunk_id: string;
-          document_id: string;
-          filename: string;
-          content: string;
-          similarity: number;
-        }) => ({
+      const { rows: entityRows } = await AppKit.lakebase.query(
+        `
+          SELECT id, entity_name, entity_type, description, source_chunk_ids,
+                 1 - (embedding <=> $1::vector) AS similarity
+          FROM rag.entities
+          ORDER BY embedding <=> $1::vector
+          LIMIT $2
+        `,
+        [vecLiteral, topK],
+      );
+
+      const entityIds: string[] = entityRows.map((r: { id: string }) => r.id);
+      let relRows: {
+        description: string;
+        source_name: string;
+        target_name: string;
+        source_chunk_ids: string[];
+      }[] = [];
+      if (entityIds.length > 0) {
+        const relResult = await AppKit.lakebase.query(
+          `
+            SELECT r.description, se.entity_name AS source_name, te.entity_name AS target_name,
+                   r.source_chunk_ids
+            FROM rag.relationships r
+            JOIN rag.entities se ON se.id = r.source_entity_id
+            JOIN rag.entities te ON te.id = r.target_entity_id
+            WHERE r.source_entity_id = ANY($1::uuid[]) OR r.target_entity_id = ANY($1::uuid[])
+            LIMIT 10
+          `,
+          [entityIds],
+        );
+        relRows = relResult.rows;
+      }
+
+      const sources: RetrievedSource[] = [];
+      const contextLines: string[] = [];
+
+      for (const row of chunkRows as {
+        chunk_id: string;
+        document_id: string;
+        filename: string;
+        content: string;
+        similarity: number;
+      }[]) {
+        sources.push({
+          kind: 'chunk',
           chunkId: row.chunk_id,
           documentId: row.document_id,
           filename: row.filename,
           snippet: row.content.slice(0, 240),
           similarity: row.similarity,
-        }),
-      );
+        });
+        contextLines.push(
+          `[${sources.length}] Document excerpt from "${row.filename}":\n${row.content}`,
+        );
+      }
 
-      const context = rows
-        .map(
-          (row: { filename: string; content: string }, i: number) =>
-            `[Source ${i + 1}: ${row.filename}]\n${row.content}`,
-        )
-        .join('\n\n---\n\n');
+      for (const row of entityRows as {
+        id: string;
+        entity_name: string;
+        entity_type: string | null;
+        description: string | null;
+        source_chunk_ids: string[];
+        similarity: number;
+      }[]) {
+        const filename = await representativeFilename(row.source_chunk_ids ?? []);
+        sources.push({
+          kind: 'entity',
+          chunkId: row.id,
+          documentId: null,
+          filename: `${row.entity_name}${row.entity_type ? ` (${row.entity_type})` : ''}${filename ? ` — from ${filename}` : ''}`,
+          snippet: row.description ?? '',
+          similarity: row.similarity,
+        });
+        contextLines.push(
+          `[${sources.length}] Entity — ${row.entity_name} (${row.entity_type || 'Entity'}):\n${row.description ?? ''}`,
+        );
+      }
+
+      for (const row of relRows) {
+        const filename = await representativeFilename(row.source_chunk_ids ?? []);
+        sources.push({
+          kind: 'relationship',
+          chunkId: randomUUID(),
+          documentId: null,
+          filename: `${row.source_name} → ${row.target_name}${filename ? ` — from ${filename}` : ''}`,
+          snippet: row.description ?? '',
+          similarity: 0,
+        });
+        contextLines.push(
+          `[${sources.length}] Relationship — ${row.source_name} → ${row.target_name}:\n${row.description ?? ''}`,
+        );
+      }
+
+      const context = contextLines.join('\n\n---\n\n');
 
       return { context, sources };
     }

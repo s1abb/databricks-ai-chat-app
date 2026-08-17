@@ -5,6 +5,7 @@ import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
 import { ChatSidebar } from '../../components/ChatSidebar';
 import { DocumentsPanel } from '../../components/DocumentsPanel';
+import { CitationModal } from '../../components/CitationModal';
 
 interface ChatContentPart {
   type?: string;
@@ -38,8 +39,9 @@ function extractContent(data: unknown): string {
 }
 
 interface RetrievedSource {
+  kind: 'chunk' | 'entity' | 'relationship';
   chunkId: string;
-  documentId: string;
+  documentId: string | null;
   filename: string;
   snippet: string;
   similarity: number;
@@ -85,6 +87,13 @@ type ModelAlias = (typeof MODEL_OPTIONS)[number]['alias'];
 
 function isModelAlias(value: string | null | undefined): value is ModelAlias {
   return MODEL_OPTIONS.some((m) => m.alias === value);
+}
+
+// Replaces standalone [n] citation markers (not markdown links like [text](url))
+// with a raw  tag that rehype-raw will parse, letting us intercept it via
+// ReactMarkdown's components prop.
+function injectCitationMarkers(content: string): string {
+  return content.replace(/\[(\d+)\](?!\()/g, (_match, n) => `<cite data-index="${n}">`);
 }
 
 interface CodeRendererProps {
@@ -160,53 +169,6 @@ function CodeRenderer({ className, children }: CodeRendererProps) {
   );
 }
 
-function SourcesList({ sources }: { sources: RetrievedSource[] }) {
-  const [open, setOpen] = useState(false);
-
-  return (
-    <div className="mt-2">
-      <button
-        type="button"
-        onClick={() => setOpen((prev) => !prev)}
-        className="flex items-center gap-1 text-xs text-gray-500 dark:text-neutral-400 hover:text-gray-700 dark:hover:text-neutral-200 transition-colors"
-      >
-        <svg
-          xmlns="http://www.w3.org/2000/svg"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          className={`h-3 w-3 transition-transform ${open ? 'rotate-90' : ''}`}
-        >
-          <path d="m9 18 6-6-6-6" />
-        </svg>
-        {sources.length} {sources.length === 1 ? 'source' : 'sources'}
-      </button>
-
-      {open && (
-        <div className="mt-2 flex flex-col gap-2">
-          {sources.map((source) => (
-            <div
-              key={source.chunkId}
-              className="rounded-lg border border-gray-200 dark:border-neutral-700 bg-gray-50 dark:bg-neutral-800 px-3 py-2"
-            >
-              <div className="text-xs font-medium text-gray-700 dark:text-neutral-300">
-                {source.filename}
-              </div>
-              <div className="text-xs text-gray-500 dark:text-neutral-400 mt-1">
-                {source.snippet}
-                {source.snippet.length >= 240 ? '…' : ''}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
 export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
@@ -219,6 +181,10 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
   const [ragEnabled, setRagEnabled] = useState(false);
   const [documents, setDocuments] = useState<RagDocument[]>([]);
   const [documentsPanelOpen, setDocumentsPanelOpen] = useState(false);
+  const [citationModal, setCitationModal] = useState<{
+    sources: RetrievedSource[];
+    focusIndex: number;
+  } | null>(null);
 
   const { invoke, loading, error } = useServingInvoke(
     { messages: [] },
@@ -256,7 +222,6 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
     formData.append('file', file);
     await fetch('/api/rag/documents', { method: 'POST', body: formData });
     await refreshDocuments();
-    // Poll briefly to catch the pending -> indexed transition without manual refresh.
     let attempts = 0;
     const interval = setInterval(async () => {
       attempts += 1;
@@ -424,7 +389,13 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
 
         sources = retrieval.sources ?? [];
         if (retrieval.context) {
-          augmentedUserContent = `Use the following retrieved context to answer the question if relevant.\n\n${retrieval.context}\n\n---\n\nQuestion: ${userContent}`;
+          augmentedUserContent = `Use the following numbered sources to answer the question. When you use information from a source, cite it inline immediately after the relevant statement using its number in square brackets, e.g. [1] or [2]. Only cite sources you actually rely on - do not cite a number that wasn't provided below, and do not add a separate reference list at the end.
+
+${retrieval.context}
+
+---
+
+Question: ${userContent}`;
         }
       } catch (err) {
         console.error('[rag-retrieve] client-side failure:', err);
@@ -463,7 +434,7 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
     MODEL_OPTIONS.find((m) => m.alias === selectedModel)?.label ?? selectedModel;
 
   return (
-    <div className="h-screen w-full flex bg-white dark:bg-neutral-900">
+    <div className="h-screen w-full flex bg-white dark:bg-neutral-950">
       <ChatSidebar
         connected={connected}
         projectName="chat-app-db"
@@ -481,18 +452,19 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
       />
 
       <div className="flex-1 flex flex-col min-w-0">
-        <div className="flex-1 overflow-y-auto px-6 pt-10 pb-8">
-          <div className="max-w-3xl mx-auto space-y-6">
+        <div className="flex-1 overflow-y-auto px-6 pt-12 pb-8">
+          <div className="max-w-3xl mx-auto space-y-7">
             {!ready && (
               <p className="text-sm text-gray-400 dark:text-neutral-500">
                 Loading conversation...
               </p>
             )}
 
-            {messages.map((msg) =>
-              msg.role === 'user' ? (
+            {messages.map((msg) => {
+              const messageSources = msg.sources ?? [];
+              return msg.role === 'user' ? (
                 <div key={msg.id} className="flex justify-end">
-                  <div className="max-w-[80%] rounded-2xl bg-gray-100 dark:bg-neutral-800 px-4 py-2">
+                  <div className="max-w-[80%] rounded-2xl bg-gray-100 dark:bg-neutral-900 px-4 py-2.5">
                     <p className="text-sm whitespace-pre-wrap text-gray-700 dark:text-neutral-200">
                       {msg.content}
                     </p>
@@ -500,23 +472,35 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
                 </div>
               ) : (
                 <div key={msg.id} className="flex justify-start">
-                  <div className="max-w-[80%]">
-                    <div className="text-sm text-gray-700 dark:text-neutral-200 [&_p]:my-2 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0 [&_ul]:list-disc [&_ul]:pl-5 [&_ul]:my-2 [&_ol]:list-decimal [&_ol]:pl-5 [&_ol]:my-2 [&_li]:my-0.5 [&_strong]:font-semibold [&_a]:text-blue-600 dark:[&_a]:text-blue-400 [&_a]:underline [&_table]:my-3 [&_table]:border-collapse [&_table]:w-full [&_th]:border [&_th]:border-gray-200 dark:[&_th]:border-neutral-700 [&_th]:bg-gray-50 dark:[&_th]:bg-neutral-800 [&_th]:px-3 [&_th]:py-1.5 [&_th]:text-left [&_th]:font-semibold [&_td]:border [&_td]:border-gray-200 dark:[&_td]:border-neutral-700 [&_td]:px-3 [&_td]:py-1.5 [&_table]:text-xs">
-                      <ReactMarkdown
-                        remarkPlugins={[remarkGfm]}
-                        rehypePlugins={[rehypeRaw]}
-                        components={{ code: CodeRenderer }}
-                      >
-                        {msg.content}
-                      </ReactMarkdown>
-                    </div>
-                    {msg.sources && msg.sources.length > 0 && (
-                      <SourcesList sources={msg.sources} />
-                    )}
+                  <div className="max-w-[85%] text-[15px] leading-7 text-gray-700 dark:text-neutral-200 [&_p]:my-3 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0 [&_ul]:list-disc [&_ul]:pl-5 [&_ul]:my-3 [&_ol]:list-decimal [&_ol]:pl-5 [&_ol]:my-3 [&_li]:my-1 [&_strong]:font-semibold [&_a]:text-[#CC785C] dark:[&_a]:text-[#E8A27C] [&_a]:underline [&_table]:my-3 [&_table]:border-collapse [&_table]:w-full [&_th]:border [&_th]:border-gray-200 dark:[&_th]:border-neutral-700 [&_th]:bg-gray-50 dark:[&_th]:bg-neutral-800 [&_th]:px-3 [&_th]:py-1.5 [&_th]:text-left [&_th]:font-semibold [&_td]:border [&_td]:border-gray-200 dark:[&_td]:border-neutral-700 [&_td]:px-3 [&_td]:py-1.5 [&_table]:text-sm">
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm]}
+                      rehypePlugins={[rehypeRaw]}
+                      components={{
+                        code: CodeRenderer,
+                        cite: (props: React.HTMLAttributes<HTMLElement> & { 'data-index'?: string }) => {
+                          const n = Number(props['data-index']);
+                          if (!n || n > messageSources.length) return null;
+                          return (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setCitationModal({ sources: messageSources, focusIndex: n })
+                              }
+                              className="inline-flex items-center justify-center h-4 min-w-4 px-1 mx-0.5 -translate-y-0.5 rounded-full bg-gray-100 dark:bg-neutral-800 text-[10px] font-medium text-gray-500 dark:text-neutral-400 hover:bg-[#CC785C]/15 hover:text-[#CC785C] dark:hover:text-[#E8A27C] transition-colors align-super"
+                            >
+                              {n}
+                            </button>
+                          );
+                        },
+                      }}
+                    >
+                      {injectCitationMarkers(msg.content)}
+                    </ReactMarkdown>
                   </div>
                 </div>
-              ),
-            )}
+              );
+            })}
 
             {loading && (
               <p className="text-sm text-gray-400 dark:text-neutral-500">Generating response</p>
@@ -532,11 +516,11 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
           </div>
         </div>
 
-        <div className="px-6 pt-4 pb-6 border-t border-gray-100 dark:border-neutral-800">
+        <div className="px-6 pt-4 pb-6 border-t border-gray-100 dark:border-neutral-900">
           <div className="max-w-3xl mx-auto">
             <form
               onSubmit={handleSubmit}
-              className="flex items-center gap-2 rounded-2xl border border-gray-200 dark:border-neutral-700 shadow-sm px-4 py-3 bg-white dark:bg-neutral-900"
+              className="flex items-center gap-2 rounded-[26px] border border-gray-200 dark:border-neutral-800 shadow-sm px-4 py-3 bg-white dark:bg-neutral-900"
             >
               <button
                 type="button"
@@ -544,7 +528,7 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
                 disabled={loading || !ready}
                 className={`flex items-center gap-1.5 text-xs rounded-full px-2.5 py-1 transition-colors disabled:opacity-50 ${
                   ragEnabled
-                    ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300'
+                    ? 'bg-[#CC785C]/15 text-[#CC785C] dark:bg-[#CC785C]/20 dark:text-[#E8A27C]'
                     : 'bg-gray-100 text-gray-500 dark:bg-neutral-800 dark:text-neutral-400'
                 }`}
               >
@@ -628,7 +612,7 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
               <button
                 type="submit"
                 disabled={loading || !ready || !input.trim()}
-                className="h-9 w-9 shrink-0 rounded-full bg-black text-white dark:bg-white dark:text-neutral-900 flex items-center justify-center disabled:opacity-40 transition-opacity"
+                className="h-9 w-9 shrink-0 rounded-full bg-[#CC785C] hover:bg-[#B8684E] text-white flex items-center justify-center disabled:opacity-40 transition-colors"
               >
                 <svg
                   xmlns="http://www.w3.org/2000/svg"
@@ -655,6 +639,14 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
         documents={documents}
         onUpload={(file) => void handleUploadDocument(file)}
         onDelete={(id) => void handleDeleteDocument(id)}
+        theme={theme}
+      />
+
+      <CitationModal
+        open={citationModal != null}
+        onClose={() => setCitationModal(null)}
+        sources={citationModal?.sources ?? []}
+        focusIndex={citationModal?.focusIndex}
         theme={theme}
       />
     </div>
