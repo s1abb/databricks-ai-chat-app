@@ -8,5 +8,7 @@ env:
     valueFrom: serving-endpoint-llama
   - name: MODEL_QWEN_ENDPOINT_NAME
     valueFrom: serving-endpoint-qwen
+  - name: MODEL_EMBED_ENDPOINT_NAME
+    valueFrom: serving-endpoint-embed
   - name: LAKEBASE_ENDPOINT
     valueFrom: postgres

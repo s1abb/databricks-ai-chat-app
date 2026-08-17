@@ -1,4 +1,5 @@
 import { createApp, server, serving, lakebase } from '@databricks/appkit';
+import { randomUUID } from 'node:crypto';
 
 interface TitleContentPart {
   type?: string;
@@ -30,6 +31,50 @@ function extractText(data: unknown): string {
   return '';
 }
 
+// Simple recursive-ish chunker: splits on paragraph breaks first, then
+// falls back to splitting oversized paragraphs by sentence, accumulating
+// into ~targetChars-sized chunks with a small overlap between them.
+function chunkText(text: string, targetChars = 3200, overlapChars = 400): string[] {
+  const paragraphs = text
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  const chunks: string[] = [];
+  let current = '';
+
+  for (const para of paragraphs) {
+    if (current.length + para.length + 2 <= targetChars) {
+      current = current ? `${current}\n\n${para}` : para;
+      continue;
+    }
+
+    if (current) {
+      chunks.push(current);
+      current = current.slice(Math.max(0, current.length - overlapChars));
+    }
+
+    if (para.length <= targetChars) {
+      current = current ? `${current}\n\n${para}` : para;
+    } else {
+      // Oversized single paragraph: split by sentence.
+      const sentences = para.split(/(?<=[.?!])\s+/);
+      let piece = current;
+      for (const sentence of sentences) {
+        if (piece.length + sentence.length + 1 > targetChars) {
+          if (piece) chunks.push(piece);
+          piece = piece.slice(Math.max(0, piece.length - overlapChars));
+        }
+        piece = piece ? `${piece} ${sentence}` : sentence;
+      }
+      current = piece;
+    }
+  }
+
+  if (current) chunks.push(current);
+  return chunks;
+}
+
 await createApp({
   plugins: [
     server(),
@@ -38,6 +83,7 @@ await createApp({
         gpt_oss_120b: { env: 'MODEL_GPT_OSS_ENDPOINT_NAME' },
         llama_3_3_70b: { env: 'MODEL_LLAMA_ENDPOINT_NAME' },
         qwen35_122b: { env: 'MODEL_QWEN_ENDPOINT_NAME' },
+        bge_embed: { env: 'MODEL_EMBED_ENDPOINT_NAME' },
       },
     }),
     lakebase(),
@@ -60,6 +106,26 @@ await createApp({
         role TEXT CHECK (role IN ('user','assistant')),
         content TEXT,
         created_at TIMESTAMPTZ DEFAULT now()
+      )
+    `);
+
+    await AppKit.lakebase.query(`CREATE SCHEMA IF NOT EXISTS rag`);
+    await AppKit.lakebase.query(`
+      CREATE TABLE IF NOT EXISTS rag.documents (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        filename TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        error_message TEXT,
+        chunk_count INT DEFAULT 0,
+        uploaded_at TIMESTAMPTZ DEFAULT now()
+      )
+    `);
+    await AppKit.lakebase.query(`
+      CREATE TABLE IF NOT EXISTS rag.chunks (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        document_id UUID REFERENCES rag.documents(id) ON DELETE CASCADE,
+        content TEXT NOT NULL,
+        chunk_order INT NOT NULL
       )
     `);
 
@@ -91,10 +157,62 @@ await createApp({
       }
     }
 
+    async function ingestDocument(documentId: string, text: string) {
+      await AppKit.lakebase.query(`UPDATE rag.documents SET status = 'processing' WHERE id = $1`, [
+        documentId,
+      ]);
+
+      try {
+        const chunks = chunkText(text);
+        if (chunks.length === 0) {
+          throw new Error('Document produced no chunks (empty content?)');
+        }
+
+        for (let i = 0; i < chunks.length; i++) {
+          await AppKit.lakebase.query(
+            `INSERT INTO rag.chunks (id, document_id, content, chunk_order) VALUES ($1, $2, $3, $4)`,
+            [randomUUID(), documentId, chunks[i], i],
+          );
+        }
+
+        await AppKit.lakebase.query(
+          `UPDATE rag.documents SET status = 'indexed', chunk_count = $2 WHERE id = $1`,
+          [documentId, chunks.length],
+        );
+      } catch (err) {
+        console.error('[rag-ingest] failed:', err);
+        await AppKit.lakebase.query(
+          `UPDATE rag.documents SET status = 'failed', error_message = $2 WHERE id = $1`,
+          [documentId, String(err)],
+        );
+      }
+    }
+
     AppKit.server.extend((app) => {
-      app.post('/api/admin/reset-chat-schema', async (_req, res) => {
-        await AppKit.lakebase.query(`DROP SCHEMA IF EXISTS chat CASCADE`);
-        res.json({ ok: true, message: 'Schema dropped. Restart the app to recreate it.' });
+      app.post('/api/rag/documents', async (req, res) => {
+        const { filename, content } = req.body as { filename?: string; content?: string };
+        if (!filename || !content) {
+          res.status(400).json({ error: 'filename and content are required' });
+          return;
+        }
+
+        const { rows } = await AppKit.lakebase.query(
+          `INSERT INTO rag.documents (filename) VALUES ($1) RETURNING id, filename, status, error_message, chunk_count, uploaded_at`,
+          [filename],
+        );
+        const document = rows[0];
+
+        // Fire-and-forget: respond immediately, ingest in the background.
+        void ingestDocument(document.id, content);
+
+        res.json(document);
+      });
+
+      app.get('/api/rag/documents', async (_req, res) => {
+        const { rows } = await AppKit.lakebase.query(
+          `SELECT id, filename, status, error_message, chunk_count, uploaded_at FROM rag.documents ORDER BY uploaded_at DESC`,
+        );
+        res.json(rows);
       });
 
       app.post('/api/chats', async (_req, res) => {

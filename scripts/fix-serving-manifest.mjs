@@ -46,6 +46,20 @@ manifest.plugins.serving.resources.required = [
       },
     },
   },
+  {
+    type: 'serving_endpoint',
+    alias: 'Embeddings',
+    resourceKey: 'serving-endpoint-embed',
+    description: 'Model Serving endpoint for inference',
+    permission: 'CAN_QUERY',
+    fields: {
+      name: {
+        env: 'MODEL_EMBED_ENDPOINT_NAME',
+        description: 'Serving endpoint name',
+        origin: 'user',
+      },
+    },
+  },
 ];
 
 fs.writeFileSync(path, JSON.stringify(manifest, null, 2) + '\n');
