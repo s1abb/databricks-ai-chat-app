@@ -35,6 +35,19 @@ function extractText(data: unknown): string {
   return '';
 }
 
+function parseJsonLoose(raw: string): unknown {
+  // Strip markdown code fences if the model wrapped its JSON in ```json ... ```
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const candidate = fenced ? fenced[1] : raw;
+
+  // Fall back to the first {...} block if there's still surrounding prose.
+  const start = candidate.indexOf('{');
+  const end = candidate.lastIndexOf('}');
+  const jsonSlice = start !== -1 && end !== -1 ? candidate.slice(start, end + 1) : candidate;
+
+  return JSON.parse(jsonSlice.trim());
+}
+
 interface EmbeddingResponse {
   data?: { embedding?: number[]; index?: number }[];
 }
@@ -101,7 +114,6 @@ async function extractTextFromUpload(filename: string, buffer: Buffer): Promise<
     await parser.destroy();
     return result.text;
   }
-  // .txt, .md, and anything else: treat as plain UTF-8 text.
   return buffer.toString('utf-8');
 }
 
@@ -111,6 +123,18 @@ interface RetrievedSource {
   filename: string;
   snippet: string;
   similarity: number;
+}
+
+interface ExtractedEntity {
+  name: string;
+  type: string;
+  description: string;
+}
+
+interface ExtractedRelationship {
+  source: string;
+  target: string;
+  description: string;
 }
 
 await createApp({
@@ -173,6 +197,26 @@ await createApp({
         chunk_order INT NOT NULL
       )
     `);
+    await AppKit.lakebase.query(`
+      CREATE TABLE IF NOT EXISTS rag.entities (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        entity_name TEXT NOT NULL,
+        entity_type TEXT,
+        description TEXT,
+        embedding VECTOR(1024),
+        source_chunk_ids UUID[] DEFAULT '{}'
+      )
+    `);
+    await AppKit.lakebase.query(`
+      CREATE TABLE IF NOT EXISTS rag.relationships (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        source_entity_id UUID REFERENCES rag.entities(id) ON DELETE CASCADE,
+        target_entity_id UUID REFERENCES rag.entities(id) ON DELETE CASCADE,
+        description TEXT,
+        embedding VECTOR(1024),
+        source_chunk_ids UUID[] DEFAULT '{}'
+      )
+    `);
 
     async function maybeGenerateTitle(chatId: string, userContent: string, assistantContent: string) {
       const { rows: countRows } = await AppKit.lakebase.query(
@@ -202,6 +246,125 @@ await createApp({
       }
     }
 
+    async function extractEntitiesAndRelationships(
+      chunkText: string,
+    ): Promise<{ entities: ExtractedEntity[]; relationships: ExtractedRelationship[] }> {
+      try {
+        const result = await AppKit.serving('gpt_oss_120b').invoke({
+          messages: [
+            {
+              role: 'user',
+              content: `Extract entities and relationships from the text below.
+
+For each entity, give a short "type" (e.g. Person, Organization, Concept, Policy, Location) and a one-sentence description.
+For each relationship, name the "source" entity, the "target" entity, and a one-sentence description of how they relate.
+Only extract entities and relationships that are explicitly present in the text. Use the entity names consistently between the entities list and the relationships list.
+
+Respond with ONLY a raw JSON object in exactly this shape - no markdown formatting, no headers, no code fences, no explanation before or after:
+{"entities": [{"name": "...", "type": "...", "description": "..."}], "relationships": [{"source": "...", "target": "...", "description": "..."}]}
+
+If there are no entities or relationships, respond with {"entities": [], "relationships": []}.
+
+Text:
+${chunkText}`,
+            },
+          ],
+        });
+
+        const raw = extractText(result).trim();
+        const parsed = parseJsonLoose(raw) as {
+          entities?: ExtractedEntity[];
+          relationships?: ExtractedRelationship[];
+        };
+        return {
+          entities: parsed.entities ?? [],
+          relationships: parsed.relationships ?? [],
+        };
+      } catch (err) {
+        console.error('[entity-extraction] failed for chunk:', err);
+        return { entities: [], relationships: [] };
+      }
+    }
+
+    async function upsertEntity(
+      name: string,
+      type: string,
+      description: string,
+      chunkId: string,
+    ): Promise<string> {
+      const normalized = name.trim();
+
+      const { rows: existing } = await AppKit.lakebase.query(
+        `SELECT id, source_chunk_ids FROM rag.entities WHERE lower(entity_name) = lower($1) LIMIT 1`,
+        [normalized],
+      );
+
+      if (existing[0]) {
+        const updatedChunkIds = Array.from(
+          new Set([...(existing[0].source_chunk_ids ?? []), chunkId]),
+        );
+        await AppKit.lakebase.query(`UPDATE rag.entities SET source_chunk_ids = $2 WHERE id = $1`, [
+          existing[0].id,
+          updatedChunkIds,
+        ]);
+        return existing[0].id;
+      }
+
+      const embedResult = await AppKit.serving('bge_embed').invoke({
+        input: [description || normalized],
+      });
+      const [embedding] = extractEmbeddings(embedResult);
+      const newId = randomUUID();
+
+      await AppKit.lakebase.query(
+        `INSERT INTO rag.entities (id, entity_name, entity_type, description, embedding, source_chunk_ids) VALUES ($1, $2, $3, $4, $5::vector, $6)`,
+        [newId, normalized, type || 'Unknown', description || '', toVectorLiteral(embedding), [chunkId]],
+      );
+      return newId;
+    }
+
+    async function processChunkGraph(chunkId: string, text: string) {
+      const { entities, relationships } = await extractEntitiesAndRelationships(text);
+      if (entities.length === 0 && relationships.length === 0) return;
+
+      const entityIdByName = new Map<string, string>();
+      for (const entity of entities) {
+        const id = await upsertEntity(entity.name, entity.type, entity.description, chunkId);
+        entityIdByName.set(entity.name.trim().toLowerCase(), id);
+      }
+
+      for (const rel of relationships) {
+        const sourceKey = rel.source.trim().toLowerCase();
+        const targetKey = rel.target.trim().toLowerCase();
+
+        let sourceId = entityIdByName.get(sourceKey);
+        if (!sourceId) {
+          sourceId = await upsertEntity(rel.source, 'Unknown', '', chunkId);
+          entityIdByName.set(sourceKey, sourceId);
+        }
+
+        let targetId = entityIdByName.get(targetKey);
+        if (!targetId) {
+          targetId = await upsertEntity(rel.target, 'Unknown', '', chunkId);
+          entityIdByName.set(targetKey, targetId);
+        }
+
+        try {
+          const embedResult = await AppKit.serving('bge_embed').invoke({
+            input: [rel.description || `${rel.source} - ${rel.target}`],
+          });
+          const [embedding] = extractEmbeddings(embedResult);
+
+          await AppKit.lakebase.query(
+            `INSERT INTO rag.relationships (id, source_entity_id, target_entity_id, description, embedding, source_chunk_ids) VALUES ($1, $2, $3, $4, $5::vector, $6)`,
+            [randomUUID(), sourceId, targetId, rel.description ?? '', toVectorLiteral(embedding), [chunkId]],
+          );
+        } catch (err) {
+          console.error('[relationship-embed] failed:', err);
+        }
+      }
+    }
+
     async function ingestDocument(documentId: string, text: string) {
       await AppKit.lakebase.query(`UPDATE rag.documents SET status = 'processing' WHERE id = $1`, [
         documentId,
@@ -221,10 +384,13 @@ await createApp({
           );
         }
 
+        const chunkIds: string[] = [];
         for (let i = 0; i < chunks.length; i++) {
+          const chunkId = randomUUID();
+          chunkIds.push(chunkId);
           await AppKit.lakebase.query(
             `INSERT INTO rag.chunks (id, document_id, content, embedding, chunk_order) VALUES ($1, $2, $3, $4::vector, $5)`,
-            [randomUUID(), documentId, chunks[i], toVectorLiteral(embeddings[i]), i],
+            [chunkId, documentId, chunks[i], toVectorLiteral(embeddings[i]), i],
           );
         }
 
@@ -232,6 +398,10 @@ await createApp({
           `UPDATE rag.documents SET status = 'indexed', chunk_count = $2 WHERE id = $1`,
           [documentId, chunks.length],
         );
+
+        for (let i = 0; i < chunks.length; i++) {
+          await processChunkGraph(chunkIds[i], chunks[i]);
+        }
       } catch (err) {
         console.error('[rag-ingest] failed:', err);
         await AppKit.lakebase.query(
@@ -327,6 +497,19 @@ await createApp({
       app.delete('/api/rag/documents/:id', async (req, res) => {
         await AppKit.lakebase.query(`DELETE FROM rag.documents WHERE id = $1`, [req.params.id]);
         res.status(204).end();
+      });
+
+      app.get('/api/rag/graph-stats', async (_req, res) => {
+        const { rows: entityRows } = await AppKit.lakebase.query(
+          `SELECT count(*)::int AS count FROM rag.entities`,
+        );
+        const { rows: relRows } = await AppKit.lakebase.query(
+          `SELECT count(*)::int AS count FROM rag.relationships`,
+        );
+        res.json({
+          entityCount: entityRows[0]?.count ?? 0,
+          relationshipCount: relRows[0]?.count ?? 0,
+        });
       });
 
       app.post('/api/rag/retrieve', async (req, res) => {
