@@ -49,9 +49,6 @@ function toVectorLiteral(vec: number[]): string {
   return `[${vec.join(',')}]`;
 }
 
-// Simple recursive-ish chunker: splits on paragraph breaks first, then
-// falls back to splitting oversized paragraphs by sentence, accumulating
-// into ~targetChars-sized chunks with a small overlap between them.
 function chunkText(text: string, targetChars = 3200, overlapChars = 400): string[] {
   const paragraphs = text
     .split(/\n\s*\n/)
@@ -75,7 +72,6 @@ function chunkText(text: string, targetChars = 3200, overlapChars = 400): string
     if (para.length <= targetChars) {
       current = current ? `${current}\n\n${para}` : para;
     } else {
-      // Oversized single paragraph: split by sentence.
       const sentences = para.split(/(?<=[.?!])\s+/);
       let piece = current;
       for (const sentence of sentences) {
@@ -91,6 +87,14 @@ function chunkText(text: string, targetChars = 3200, overlapChars = 400): string
 
   if (current) chunks.push(current);
   return chunks;
+}
+
+interface RetrievedSource {
+  chunkId: string;
+  documentId: string;
+  filename: string;
+  snippet: string;
+  similarity: number;
 }
 
 await createApp({
@@ -117,6 +121,9 @@ await createApp({
         updated_at TIMESTAMPTZ DEFAULT now()
       )
     `);
+    await AppKit.lakebase.query(
+      `ALTER TABLE chat.chats ADD COLUMN IF NOT EXISTS rag_enabled BOOLEAN DEFAULT false`,
+    );
     await AppKit.lakebase.query(`
       CREATE TABLE IF NOT EXISTS chat.messages (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -126,6 +133,9 @@ await createApp({
         created_at TIMESTAMPTZ DEFAULT now()
       )
     `);
+    await AppKit.lakebase.query(
+      `ALTER TABLE chat.messages ADD COLUMN IF NOT EXISTS sources JSONB`,
+    );
 
     await AppKit.lakebase.query(`CREATE SCHEMA IF NOT EXISTS rag`);
     await AppKit.lakebase.query(`
@@ -215,7 +225,55 @@ await createApp({
       }
     }
 
-    AppKit.server.extend((app) => {     
+    async function retrieveContext(
+      query: string,
+      topK = 5,
+    ): Promise<{ context: string; sources: RetrievedSource[] }> {
+      const embedResult = await AppKit.serving('bge_embed').invoke({ input: [query] });
+      const [queryEmbedding] = extractEmbeddings(embedResult);
+      if (!queryEmbedding) {
+        return { context: '', sources: [] };
+      }
+
+      const { rows } = await AppKit.lakebase.query(
+        `
+          SELECT c.id AS chunk_id, c.content, d.id AS document_id, d.filename,
+                 1 - (c.embedding <=> $1::vector) AS similarity
+          FROM rag.chunks c
+          JOIN rag.documents d ON d.id = c.document_id
+          ORDER BY c.embedding <=> $1::vector
+          LIMIT $2
+        `,
+        [toVectorLiteral(queryEmbedding), topK],
+      );
+
+      const sources: RetrievedSource[] = rows.map(
+        (row: {
+          chunk_id: string;
+          document_id: string;
+          filename: string;
+          content: string;
+          similarity: number;
+        }) => ({
+          chunkId: row.chunk_id,
+          documentId: row.document_id,
+          filename: row.filename,
+          snippet: row.content.slice(0, 240),
+          similarity: row.similarity,
+        }),
+      );
+
+      const context = rows
+        .map(
+          (row: { filename: string; content: string }, i: number) =>
+            `[Source ${i + 1}: ${row.filename}]\n${row.content}`,
+        )
+        .join('\n\n---\n\n');
+
+      return { context, sources };
+    }
+
+    AppKit.server.extend((app) => {
       app.post('/api/rag/documents', async (req, res) => {
         const { filename, content } = req.body as { filename?: string; content?: string };
         if (!filename || !content) {
@@ -229,7 +287,6 @@ await createApp({
         );
         const document = rows[0];
 
-        // Fire-and-forget: respond immediately, ingest in the background.
         void ingestDocument(document.id, content);
 
         res.json(document);
@@ -242,27 +299,57 @@ await createApp({
         res.json(rows);
       });
 
+      app.post('/api/rag/retrieve', async (req, res) => {
+        const { query } = req.body as { query?: string };
+        if (!query) {
+          res.status(400).json({ error: 'query is required' });
+          return;
+        }
+        try {
+          const result = await retrieveContext(query);
+          res.json(result);
+        } catch (err) {
+          console.error('[rag-retrieve] failed:', err);
+          res.status(500).json({ error: String(err) });
+        }
+      });
+
       app.post('/api/chats', async (_req, res) => {
         const { rows } = await AppKit.lakebase.query(
-          `INSERT INTO chat.chats DEFAULT VALUES RETURNING id, title, last_model, created_at, updated_at`,
+          `INSERT INTO chat.chats DEFAULT VALUES RETURNING id, title, last_model, rag_enabled, created_at, updated_at`,
         );
         res.json(rows[0]);
       });
 
       app.get('/api/chats', async (_req, res) => {
         const { rows } = await AppKit.lakebase.query(
-          `SELECT id, title, last_model, created_at, updated_at FROM chat.chats ORDER BY updated_at DESC`,
+          `SELECT id, title, last_model, rag_enabled, created_at, updated_at FROM chat.chats ORDER BY updated_at DESC`,
         );
         res.json(rows);
       });
 
       app.patch('/api/chats/:chatId', async (req, res) => {
-        const { title } = req.body as { title: string };
-        const { rows } = await AppKit.lakebase.query(
-          `UPDATE chat.chats SET title = $1 WHERE id = $2 RETURNING id, title, last_model, created_at, updated_at`,
-          [title, req.params.chatId],
-        );
-        res.json(rows[0]);
+        const { title, rag_enabled } = req.body as { title?: string; rag_enabled?: boolean };
+
+        if (title !== undefined) {
+          const { rows } = await AppKit.lakebase.query(
+            `UPDATE chat.chats SET title = $1 WHERE id = $2 RETURNING id, title, last_model, rag_enabled, created_at, updated_at`,
+            [title, req.params.chatId],
+          );
+          res.json(rows[0]);
+          return;
+        }
+
+        if (rag_enabled !== undefined) {
+          const { rows } = await AppKit.lakebase.query(
+            `UPDATE chat.chats SET rag_enabled = $1 WHERE id = $2 RETURNING id, title, last_model, rag_enabled, created_at, updated_at`,
+            [rag_enabled, req.params.chatId],
+          );
+          res.json(rows[0]);
+          return;
+        }
+
+        res.status(400).json({ error: 'title or rag_enabled is required' });
       });
 
       app.delete('/api/chats/:chatId', async (req, res) => {
@@ -272,21 +359,22 @@ await createApp({
 
       app.get('/api/chats/:chatId/messages', async (req, res) => {
         const { rows } = await AppKit.lakebase.query(
-          `SELECT id, role, content, created_at FROM chat.messages WHERE chat_id = $1 ORDER BY created_at ASC`,
+          `SELECT id, role, content, sources, created_at FROM chat.messages WHERE chat_id = $1 ORDER BY created_at ASC`,
           [req.params.chatId],
         );
         res.json(rows);
       });
 
       app.post('/api/chats/:chatId/messages', async (req, res) => {
-        const { role, content, model } = req.body as {
+        const { role, content, model, sources } = req.body as {
           role: 'user' | 'assistant';
           content: string;
           model?: string;
+          sources?: RetrievedSource[];
         };
         const { rows } = await AppKit.lakebase.query(
-          `INSERT INTO chat.messages (chat_id, role, content) VALUES ($1, $2, $3) RETURNING id, role, content, created_at`,
-          [req.params.chatId, role, content],
+          `INSERT INTO chat.messages (chat_id, role, content, sources) VALUES ($1, $2, $3, $4) RETURNING id, role, content, sources, created_at`,
+          [req.params.chatId, role, content, sources ? JSON.stringify(sources) : null],
         );
         if (model) {
           await AppKit.lakebase.query(

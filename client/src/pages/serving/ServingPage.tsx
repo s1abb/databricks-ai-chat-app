@@ -36,16 +36,26 @@ function extractContent(data: unknown): string {
   return content != null ? JSON.stringify(data) : '';
 }
 
+interface RetrievedSource {
+  chunkId: string;
+  documentId: string;
+  filename: string;
+  snippet: string;
+  similarity: number;
+}
+
 interface Message {
   id: string;
   role: 'user' | 'assistant';
   content: string;
+  sources?: RetrievedSource[] | null;
 }
 
 interface ChatSummary {
   id: string;
   title: string | null;
   last_model: string | null;
+  rag_enabled: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -140,6 +150,53 @@ function CodeRenderer({ className, children }: CodeRendererProps) {
   );
 }
 
+function SourcesList({ sources }: { sources: RetrievedSource[] }) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div className="mt-2">
+      <button
+        type="button"
+        onClick={() => setOpen((prev) => !prev)}
+        className="flex items-center gap-1 text-xs text-gray-500 dark:text-neutral-400 hover:text-gray-700 dark:hover:text-neutral-200 transition-colors"
+      >
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className={`h-3 w-3 transition-transform ${open ? 'rotate-90' : ''}`}
+        >
+          <path d="m9 18 6-6-6-6" />
+        </svg>
+        {sources.length} {sources.length === 1 ? 'source' : 'sources'}
+      </button>
+
+      {open && (
+        <div className="mt-2 flex flex-col gap-2">
+          {sources.map((source) => (
+            <div
+              key={source.chunkId}
+              className="rounded-lg border border-gray-200 dark:border-neutral-700 bg-gray-50 dark:bg-neutral-800 px-3 py-2"
+            >
+              <div className="text-xs font-medium text-gray-700 dark:text-neutral-300">
+                {source.filename}
+              </div>
+              <div className="text-xs text-gray-500 dark:text-neutral-400 mt-1">
+                {source.snippet}
+                {source.snippet.length >= 240 ? '…' : ''}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
@@ -149,6 +206,7 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
   const [connected, setConnected] = useState(false);
   const [selectedModel, setSelectedModel] = useState<ModelAlias>(MODEL_OPTIONS[0].alias);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [ragEnabled, setRagEnabled] = useState(false);
 
   const { invoke, loading, error } = useServingInvoke(
     { messages: [] },
@@ -195,6 +253,7 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
       }
       setChatId(active.id);
       setSelectedModel(isModelAlias(active.last_model) ? active.last_model : MODEL_OPTIONS[0].alias);
+      setRagEnabled(active.rag_enabled ?? false);
       await loadMessagesFor(active.id);
       setConnected(true);
     } catch {
@@ -217,6 +276,7 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
       setChatId(created.id);
       setMessages([]);
       setSelectedModel(MODEL_OPTIONS[0].alias);
+      setRagEnabled(created.rag_enabled ?? false);
       await refreshChats();
       setConnected(true);
     } catch {
@@ -234,8 +294,9 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
       setChatId(id);
       const target = chats.find((c) => c.id === id);
       setSelectedModel(
-        isModelAlias(target?.last_model) ? target!.last_model! as ModelAlias : MODEL_OPTIONS[0].alias,
+        isModelAlias(target?.last_model) ? (target!.last_model as ModelAlias) : MODEL_OPTIONS[0].alias,
       );
+      setRagEnabled(target?.rag_enabled ?? false);
       setConnected(true);
     } catch {
       setConnected(false);
@@ -264,6 +325,7 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
       setChatId(created.id);
       setMessages([]);
       setSelectedModel(MODEL_OPTIONS[0].alias);
+      setRagEnabled(created.rag_enabled ?? false);
       await fetch(`/api/chats/${id}`, { method: 'DELETE' });
       await refreshChats();
       return;
@@ -277,6 +339,18 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
     }
   }
 
+  async function handleToggleRag() {
+    if (!chatId) return;
+    const next = !ragEnabled;
+    setRagEnabled(next);
+    setChats((prev) => prev.map((c) => (c.id === chatId ? { ...c, rag_enabled: next } : c)));
+    await fetch(`/api/chats/${chatId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rag_enabled: next }),
+    });
+  }
+
   async function sendMessage(content: string) {
     if (!content.trim() || loading || !chatId) return;
 
@@ -288,32 +362,55 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
       content: userContent,
     };
 
-    const fullMessages = [
-      ...messages.map(({ role, content: c }) => ({ role, content: c })),
-      { role: 'user' as const, content: userContent },
-    ];
-
     setMessages((prev) => [...prev, userMessage]);
     setInput('');
 
     await fetch(`/api/chats/${activeChatId}/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ role: 'user', content: userContent, model: selectedModel }),
+      body: JSON.stringify({ role: 'user', content: userContent }),
     });
+
+    let sources: RetrievedSource[] = [];
+    let augmentedUserContent = userContent;
+
+    if (ragEnabled) {
+      try {
+        const retrieval: { context: string; sources: RetrievedSource[] } = await fetch(
+          '/api/rag/retrieve',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: userContent }),
+          },
+        ).then((r) => r.json());
+
+        sources = retrieval.sources ?? [];
+        if (retrieval.context) {
+          augmentedUserContent = `Use the following retrieved context to answer the question if relevant.\n\n${retrieval.context}\n\n---\n\nQuestion: ${userContent}`;
+        }
+      } catch (err) {
+        console.error('[rag-retrieve] client-side failure:', err);
+      }
+    }
+
+    const fullMessages = [
+      ...messages.map(({ role, content: c }) => ({ role, content: c })),
+      { role: 'user' as const, content: augmentedUserContent },
+    ];
 
     const result = await invoke({ messages: fullMessages });
     if (result) {
       const assistantContent = extractContent(result);
       setMessages((prev) => [
         ...prev,
-        { id: crypto.randomUUID(), role: 'assistant', content: assistantContent },
+        { id: crypto.randomUUID(), role: 'assistant', content: assistantContent, sources },
       ]);
 
       await fetch(`/api/chats/${activeChatId}/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ role: 'assistant', content: assistantContent }),
+        body: JSON.stringify({ role: 'assistant', content: assistantContent, sources }),
       });
 
       await refreshChats();
@@ -345,7 +442,7 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
       />
 
       <div className="flex-1 flex flex-col min-w-0">
-        <div className="flex-1 overflow-y-auto px-6 py-8">
+        <div className="flex-1 overflow-y-auto px-6 pt-10 pb-8">
           <div className="max-w-3xl mx-auto space-y-6">
             {!ready && (
               <p className="text-sm text-gray-400 dark:text-neutral-500">
@@ -364,14 +461,19 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
                 </div>
               ) : (
                 <div key={msg.id} className="flex justify-start">
-                  <div className="max-w-[80%] text-sm text-gray-700 dark:text-neutral-200 [&_p]:my-2 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0 [&_ul]:list-disc [&_ul]:pl-5 [&_ul]:my-2 [&_ol]:list-decimal [&_ol]:pl-5 [&_ol]:my-2 [&_li]:my-0.5 [&_strong]:font-semibold [&_a]:text-blue-600 dark:[&_a]:text-blue-400 [&_a]:underline [&_table]:my-3 [&_table]:border-collapse [&_table]:w-full [&_th]:border [&_th]:border-gray-200 dark:[&_th]:border-neutral-700 [&_th]:bg-gray-50 dark:[&_th]:bg-neutral-800 [&_th]:px-3 [&_th]:py-1.5 [&_th]:text-left [&_th]:font-semibold [&_td]:border [&_td]:border-gray-200 dark:[&_td]:border-neutral-700 [&_td]:px-3 [&_td]:py-1.5 [&_table]:text-xs">
-                    <ReactMarkdown
-                      remarkPlugins={[remarkGfm]}
-                      rehypePlugins={[rehypeRaw]}
-                      components={{ code: CodeRenderer }}
-                    >
-                      {msg.content}
-                    </ReactMarkdown>
+                  <div className="max-w-[80%]">
+                    <div className="text-sm text-gray-700 dark:text-neutral-200 [&_p]:my-2 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0 [&_ul]:list-disc [&_ul]:pl-5 [&_ul]:my-2 [&_ol]:list-decimal [&_ol]:pl-5 [&_ol]:my-2 [&_li]:my-0.5 [&_strong]:font-semibold [&_a]:text-blue-600 dark:[&_a]:text-blue-400 [&_a]:underline [&_table]:my-3 [&_table]:border-collapse [&_table]:w-full [&_th]:border [&_th]:border-gray-200 dark:[&_th]:border-neutral-700 [&_th]:bg-gray-50 dark:[&_th]:bg-neutral-800 [&_th]:px-3 [&_th]:py-1.5 [&_th]:text-left [&_th]:font-semibold [&_td]:border [&_td]:border-gray-200 dark:[&_td]:border-neutral-700 [&_td]:px-3 [&_td]:py-1.5 [&_table]:text-xs">
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm]}
+                        rehypePlugins={[rehypeRaw]}
+                        components={{ code: CodeRenderer }}
+                      >
+                        {msg.content}
+                      </ReactMarkdown>
+                    </div>
+                    {msg.sources && msg.sources.length > 0 && (
+                      <SourcesList sources={msg.sources} />
+                    )}
                   </div>
                 </div>
               ),
@@ -397,6 +499,32 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
               onSubmit={handleSubmit}
               className="flex items-center gap-2 rounded-2xl border border-gray-200 dark:border-neutral-700 shadow-sm px-4 py-3 bg-white dark:bg-neutral-900"
             >
+              <button
+                type="button"
+                onClick={() => void handleToggleRag()}
+                disabled={loading || !ready}
+                className={`flex items-center gap-1.5 text-xs rounded-full px-2.5 py-1 transition-colors disabled:opacity-50 ${
+                  ragEnabled
+                    ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300'
+                    : 'bg-gray-100 text-gray-500 dark:bg-neutral-800 dark:text-neutral-400'
+                }`}
+              >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="h-3.5 w-3.5"
+                >
+                  <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+                  <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z" />
+                </svg>
+                Knowledge base
+              </button>
+
               <input
                 type="text"
                 value={input}
