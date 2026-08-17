@@ -31,6 +31,24 @@ function extractText(data: unknown): string {
   return '';
 }
 
+interface EmbeddingResponse {
+  data?: { embedding?: number[]; index?: number }[];
+}
+
+function extractEmbeddings(data: unknown): number[][] {
+  const wrapper = data as { ok?: boolean; data?: EmbeddingResponse };
+  const resp = (wrapper?.data ?? (data as EmbeddingResponse)) as EmbeddingResponse;
+  const items = resp?.data ?? [];
+  return items
+    .slice()
+    .sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
+    .map((item) => item.embedding ?? []);
+}
+
+function toVectorLiteral(vec: number[]): string {
+  return `[${vec.join(',')}]`;
+}
+
 // Simple recursive-ish chunker: splits on paragraph breaks first, then
 // falls back to splitting oversized paragraphs by sentence, accumulating
 // into ~targetChars-sized chunks with a small overlap between them.
@@ -125,6 +143,7 @@ await createApp({
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         document_id UUID REFERENCES rag.documents(id) ON DELETE CASCADE,
         content TEXT NOT NULL,
+        embedding VECTOR(1024),
         chunk_order INT NOT NULL
       )
     `);
@@ -168,10 +187,18 @@ await createApp({
           throw new Error('Document produced no chunks (empty content?)');
         }
 
+        const embedResult = await AppKit.serving('bge_embed').invoke({ input: chunks });
+        const embeddings = extractEmbeddings(embedResult);
+        if (embeddings.length !== chunks.length) {
+          throw new Error(
+            `Embedding count mismatch: got ${embeddings.length} vectors for ${chunks.length} chunks`,
+          );
+        }
+
         for (let i = 0; i < chunks.length; i++) {
           await AppKit.lakebase.query(
-            `INSERT INTO rag.chunks (id, document_id, content, chunk_order) VALUES ($1, $2, $3, $4)`,
-            [randomUUID(), documentId, chunks[i], i],
+            `INSERT INTO rag.chunks (id, document_id, content, embedding, chunk_order) VALUES ($1, $2, $3, $4::vector, $5)`,
+            [randomUUID(), documentId, chunks[i], toVectorLiteral(embeddings[i]), i],
           );
         }
 
@@ -188,7 +215,7 @@ await createApp({
       }
     }
 
-    AppKit.server.extend((app) => {
+    AppKit.server.extend((app) => {     
       app.post('/api/rag/documents', async (req, res) => {
         const { filename, content } = req.body as { filename?: string; content?: string };
         if (!filename || !content) {
