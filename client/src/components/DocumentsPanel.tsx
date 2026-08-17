@@ -179,11 +179,11 @@ export function DocumentsPanel({
             <p className="text-xs text-gray-500 dark:text-neutral-400">
               Drop a file here, or <span className="text-blue-600 dark:text-blue-400">browse</span>
             </p>
-            <p className="text-[11px] text-gray-400 dark:text-neutral-500">.txt, .md, or .pdf</p>
+            <p className="text-[11px] text-gray-400 dark:text-neutral-500">.txt, .md, .pdf, or .docx</p>
             <input
               ref={fileInputRef}
               type="file"
-              accept=".txt,.md,.pdf"
+              accept=".txt,.md,.pdf,.docx"
               onChange={(e) => {
                 handleFiles(e.target.files);
                 e.target.value = '';

@@ -64,6 +64,26 @@ function toVectorLiteral(vec: number[]): string {
   return `[${vec.join(',')}]`;
 }
 
+async function embedInBatches(
+  invokeEmbed: (input: string[]) => Promise<unknown>,
+  texts: string[],
+  batchSize = 15,
+): Promise<number[][]> {
+  const allEmbeddings: number[][] = [];
+  for (let i = 0; i < texts.length; i += batchSize) {
+    const batch = texts.slice(i, i + batchSize);
+    const result = await invokeEmbed(batch);
+    const embeddings = extractEmbeddings(result);
+    if (embeddings.length !== batch.length) {
+      throw new Error(
+        `Embedding batch mismatch: got ${embeddings.length} vectors for ${batch.length} texts`,
+      );
+    }
+    allEmbeddings.push(...embeddings);
+  }
+  return allEmbeddings;
+}
+
 function chunkText(text: string, targetChars = 3200, overlapChars = 400): string[] {
   const paragraphs = text
     .split(/\n\s*\n/)
@@ -163,6 +183,9 @@ await createApp({
     await AppKit.lakebase.query(
       `ALTER TABLE chat.chats ADD COLUMN IF NOT EXISTS rag_enabled BOOLEAN DEFAULT false`,
     );
+    await AppKit.lakebase.query(
+      `ALTER TABLE chat.chats ADD COLUMN IF NOT EXISTS retrieval_mode TEXT DEFAULT 'chunks'`,
+    );
     await AppKit.lakebase.query(`
       CREATE TABLE IF NOT EXISTS chat.messages (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -242,6 +265,43 @@ await createApp({
         }
       } catch (err) {
         console.error('[title-generation] failed:', err);
+      }
+    }
+
+    async function rewriteQueryForRetrieval(
+      history: { role: 'user' | 'assistant'; content: string }[],
+      newMessage: string,
+    ): Promise<string> {
+      if (history.length === 0) return newMessage;
+
+      try {
+        const historyText = history
+          .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
+          .join('\n');
+
+        const result = await AppKit.serving('gpt_oss_120b').invoke({
+          messages: [
+            {
+              role: 'user',
+              content: `Given the conversation history below and a new follow-up message, rewrite the follow-up into a standalone search query that includes any context needed to understand it on its own (e.g. resolve "it", "that", "the second one" into what they actually refer to).
+
+If the follow-up message is already standalone and doesn't depend on the history, just return it unchanged.
+
+Respond with ONLY the rewritten query text - no quotes, no explanation, no preamble.
+
+Conversation history:
+${historyText}
+
+Follow-up message: ${newMessage}`,
+            },
+          ],
+        });
+
+        const rewritten = extractText(result).trim().replace(/^["']|["']$/g, '');
+        return rewritten || newMessage;
+      } catch (err) {
+        console.error('[query-rewrite] failed, falling back to raw query:', err);
+        return newMessage;
       }
     }
 
@@ -375,13 +435,10 @@ ${chunkText}`,
           throw new Error('Document produced no chunks (empty content?)');
         }
 
-        const embedResult = await AppKit.serving('bge_embed').invoke({ input: chunks });
-        const embeddings = extractEmbeddings(embedResult);
-        if (embeddings.length !== chunks.length) {
-          throw new Error(
-            `Embedding count mismatch: got ${embeddings.length} vectors for ${chunks.length} chunks`,
-          );
-        }
+        const embeddings = await embedInBatches(
+          (batch) => AppKit.serving('bge_embed').invoke({ input: batch }),
+          chunks,
+        );
 
         const chunkIds: string[] = [];
         for (let i = 0; i < chunks.length; i++) {
@@ -421,7 +478,9 @@ ${chunkText}`,
 
     async function retrieveContext(
       query: string,
+      mode: 'chunks' | 'graph' | 'both' = 'chunks',
       topK = 5,
+      minSimilarity = 0.5,
     ): Promise<{ context: string; sources: RetrievedSource[] }> {
       const embedResult = await AppKit.serving('bge_embed').invoke({ input: [query] });
       const [queryEmbedding] = extractEmbeddings(embedResult);
@@ -430,8 +489,11 @@ ${chunkText}`,
       }
       const vecLiteral = toVectorLiteral(queryEmbedding);
 
-      const { rows: chunkRows } = await AppKit.lakebase.query(
-        `
+      const rawChunkRows =
+        mode === 'chunks' || mode === 'both'
+          ? (
+              await AppKit.lakebase.query(
+                `
           SELECT c.id AS chunk_id, c.content, d.id AS document_id, d.filename,
                  1 - (c.embedding <=> $1::vector) AS similarity
           FROM rag.chunks c
@@ -439,21 +501,37 @@ ${chunkText}`,
           ORDER BY c.embedding <=> $1::vector
           LIMIT $2
         `,
-        [vecLiteral, topK],
-      );
+                [vecLiteral, topK],
+              )
+            ).rows
+          : [];
 
-      const { rows: entityRows } = await AppKit.lakebase.query(
-        `
+      const rawEntityRows =
+        mode === 'graph' || mode === 'both'
+          ? (
+              await AppKit.lakebase.query(
+                `
           SELECT id, entity_name, entity_type, description, source_chunk_ids,
                  1 - (embedding <=> $1::vector) AS similarity
           FROM rag.entities
           ORDER BY embedding <=> $1::vector
           LIMIT $2
         `,
-        [vecLiteral, topK],
+                [vecLiteral, topK],
+              )
+            ).rows
+          : [];
+
+      const chunkRows = (rawChunkRows as { similarity: number }[]).filter(
+        (row) => row.similarity >= minSimilarity,
+      );
+      const entityRows = (rawEntityRows as { similarity: number }[]).filter(
+        (row) => row.similarity >= minSimilarity,
       );
 
-      const entityIds: string[] = entityRows.map((r: { id: string }) => r.id);
+      const entityIds: string[] = (entityRows as { id: string; similarity: number }[]).map(
+        (r) => r.id,
+      );
       let relRows: {
         description: string;
         source_name: string;
@@ -595,14 +673,19 @@ ${chunkText}`,
       });
 
       app.post('/api/rag/retrieve', async (req, res) => {
-        const { query } = req.body as { query?: string };
+        const { query, history, mode } = req.body as {
+          query?: string;
+          history?: { role: 'user' | 'assistant'; content: string }[];
+          mode?: 'chunks' | 'graph' | 'both';
+        };
         if (!query) {
           res.status(400).json({ error: 'query is required' });
           return;
         }
         try {
-          const result = await retrieveContext(query);
-          res.json(result);
+          const searchQuery = await rewriteQueryForRetrieval(history ?? [], query);
+          const result = await retrieveContext(searchQuery, mode ?? 'chunks');
+          res.json({ ...result, searchQuery });
         } catch (err) {
           console.error('[rag-retrieve] failed:', err);
           res.status(500).json({ error: String(err) });
@@ -611,24 +694,28 @@ ${chunkText}`,
 
       app.post('/api/chats', async (_req, res) => {
         const { rows } = await AppKit.lakebase.query(
-          `INSERT INTO chat.chats DEFAULT VALUES RETURNING id, title, last_model, rag_enabled, created_at, updated_at`,
+          `INSERT INTO chat.chats DEFAULT VALUES RETURNING id, title, last_model, rag_enabled, retrieval_mode, created_at, updated_at`,
         );
         res.json(rows[0]);
       });
 
       app.get('/api/chats', async (_req, res) => {
         const { rows } = await AppKit.lakebase.query(
-          `SELECT id, title, last_model, rag_enabled, created_at, updated_at FROM chat.chats ORDER BY updated_at DESC`,
+          `SELECT id, title, last_model, rag_enabled, retrieval_mode, created_at, updated_at FROM chat.chats ORDER BY updated_at DESC`,
         );
         res.json(rows);
       });
 
       app.patch('/api/chats/:chatId', async (req, res) => {
-        const { title, rag_enabled } = req.body as { title?: string; rag_enabled?: boolean };
+        const { title, rag_enabled, retrieval_mode } = req.body as {
+          title?: string;
+          rag_enabled?: boolean;
+          retrieval_mode?: 'chunks' | 'graph';
+        };
 
         if (title !== undefined) {
           const { rows } = await AppKit.lakebase.query(
-            `UPDATE chat.chats SET title = $1 WHERE id = $2 RETURNING id, title, last_model, rag_enabled, created_at, updated_at`,
+            `UPDATE chat.chats SET title = $1 WHERE id = $2 RETURNING id, title, last_model, rag_enabled, retrieval_mode, created_at, updated_at`,
             [title, req.params.chatId],
           );
           res.json(rows[0]);
@@ -637,14 +724,23 @@ ${chunkText}`,
 
         if (rag_enabled !== undefined) {
           const { rows } = await AppKit.lakebase.query(
-            `UPDATE chat.chats SET rag_enabled = $1 WHERE id = $2 RETURNING id, title, last_model, rag_enabled, created_at, updated_at`,
+            `UPDATE chat.chats SET rag_enabled = $1 WHERE id = $2 RETURNING id, title, last_model, rag_enabled, retrieval_mode, created_at, updated_at`,
             [rag_enabled, req.params.chatId],
           );
           res.json(rows[0]);
           return;
         }
 
-        res.status(400).json({ error: 'title or rag_enabled is required' });
+        if (retrieval_mode !== undefined) {
+          const { rows } = await AppKit.lakebase.query(
+            `UPDATE chat.chats SET retrieval_mode = $1 WHERE id = $2 RETURNING id, title, last_model, rag_enabled, retrieval_mode, created_at, updated_at`,
+            [retrieval_mode, req.params.chatId],
+          );
+          res.json(rows[0]);
+          return;
+        }
+
+        res.status(400).json({ error: 'title, rag_enabled, or retrieval_mode is required' });
       });
 
       app.delete('/api/chats/:chatId', async (req, res) => {

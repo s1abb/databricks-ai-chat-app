@@ -54,11 +54,14 @@ interface Message {
   sources?: RetrievedSource[] | null;
 }
 
+type RetrievalMode = 'chunks' | 'graph' | 'both';
+
 interface ChatSummary {
   id: string;
   title: string | null;
   last_model: string | null;
   rag_enabled: boolean;
+  retrieval_mode: RetrievalMode | null;
   created_at: string;
   updated_at: string;
 }
@@ -89,11 +92,8 @@ function isModelAlias(value: string | null | undefined): value is ModelAlias {
   return MODEL_OPTIONS.some((m) => m.alias === value);
 }
 
-// Replaces standalone [n] citation markers (not markdown links like [text](url))
-// with a raw  tag that rehype-raw will parse, letting us intercept it via
-// ReactMarkdown's components prop.
 function injectCitationMarkers(content: string): string {
-  return content.replace(/\[(\d+)\](?!\()/g, (_match, n) => `<cite data-index="${n}">`);
+  return content.replace(/\[(\d+)\](?!\()/g, (_match, n) => `<cite data-index="${n}"></cite>`);
 }
 
 interface CodeRendererProps {
@@ -179,6 +179,7 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
   const [selectedModel, setSelectedModel] = useState<ModelAlias>(MODEL_OPTIONS[0].alias);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [ragEnabled, setRagEnabled] = useState(false);
+  const [retrievalMode, setRetrievalMode] = useState<RetrievalMode>('chunks');
   const [documents, setDocuments] = useState<RagDocument[]>([]);
   const [documentsPanelOpen, setDocumentsPanelOpen] = useState(false);
   const [citationModal, setCitationModal] = useState<{
@@ -256,6 +257,7 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
       setChatId(active.id);
       setSelectedModel(isModelAlias(active.last_model) ? active.last_model : MODEL_OPTIONS[0].alias);
       setRagEnabled(active.rag_enabled ?? false);
+      setRetrievalMode(active.retrieval_mode ?? 'chunks');
       await loadMessagesFor(active.id);
       setConnected(true);
     } catch {
@@ -279,6 +281,7 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
       setMessages([]);
       setSelectedModel(MODEL_OPTIONS[0].alias);
       setRagEnabled(created.rag_enabled ?? false);
+      setRetrievalMode(created.retrieval_mode ?? 'chunks');
       await refreshChats();
       setConnected(true);
     } catch {
@@ -299,6 +302,7 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
         isModelAlias(target?.last_model) ? (target!.last_model as ModelAlias) : MODEL_OPTIONS[0].alias,
       );
       setRagEnabled(target?.rag_enabled ?? false);
+      setRetrievalMode(target?.retrieval_mode ?? 'chunks');
       setConnected(true);
     } catch {
       setConnected(false);
@@ -328,6 +332,7 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
       setMessages([]);
       setSelectedModel(MODEL_OPTIONS[0].alias);
       setRagEnabled(created.rag_enabled ?? false);
+      setRetrievalMode(created.retrieval_mode ?? 'chunks');
       await fetch(`/api/chats/${id}`, { method: 'DELETE' });
       await refreshChats();
       return;
@@ -350,6 +355,17 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ rag_enabled: next }),
+    });
+  }
+
+  async function handleSetRetrievalMode(mode: RetrievalMode) {
+    if (!chatId || mode === retrievalMode) return;
+    setRetrievalMode(mode);
+    setChats((prev) => prev.map((c) => (c.id === chatId ? { ...c, retrieval_mode: mode } : c)));
+    await fetch(`/api/chats/${chatId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ retrieval_mode: mode }),
     });
   }
 
@@ -378,14 +394,20 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
 
     if (ragEnabled) {
       try {
-        const retrieval: { context: string; sources: RetrievedSource[] } = await fetch(
-          '/api/rag/retrieve',
-          {
+        const recentHistory = messages
+          .slice(-6)
+          .map(({ role, content: c }) => ({ role, content: c }));
+
+        const retrieval: { context: string; sources: RetrievedSource[]; searchQuery?: string } =
+          await fetch('/api/rag/retrieve', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ query: userContent }),
-          },
-        ).then((r) => r.json());
+            body: JSON.stringify({
+              query: userContent,
+              history: recentHistory,
+              mode: retrievalMode,
+            }),
+          }).then((r) => r.json());
 
         sources = retrieval.sources ?? [];
         if (retrieval.context) {
@@ -520,114 +542,161 @@ Question: ${userContent}`;
           <div className="max-w-3xl mx-auto">
             <form
               onSubmit={handleSubmit}
-              className="flex items-center gap-2 rounded-[26px] border border-gray-200 dark:border-neutral-800 shadow-sm px-4 py-3 bg-white dark:bg-neutral-900"
+              className="flex flex-col gap-2 rounded-[26px] border border-gray-200 dark:border-neutral-800 shadow-sm px-4 pt-3 pb-2.5 bg-white dark:bg-neutral-900"
             >
-              <button
-                type="button"
-                onClick={() => void handleToggleRag()}
-                disabled={loading || !ready}
-                className={`flex items-center gap-1.5 text-xs rounded-full px-2.5 py-1 transition-colors disabled:opacity-50 ${
-                  ragEnabled
-                    ? 'bg-[#CC785C]/15 text-[#CC785C] dark:bg-[#CC785C]/20 dark:text-[#E8A27C]'
-                    : 'bg-gray-100 text-gray-500 dark:bg-neutral-800 dark:text-neutral-400'
-                }`}
-              >
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  className="h-3.5 w-3.5"
-                >
-                  <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
-                  <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z" />
-                </svg>
-                Knowledge base
-              </button>
-
               <input
                 type="text"
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 placeholder="Ask a question..."
-                className="flex-1 text-sm text-gray-900 dark:text-neutral-100 placeholder:text-gray-400 dark:placeholder:text-neutral-500 bg-transparent border-0 outline-none ring-0 focus:outline-none focus:ring-0 appearance-none"
+                className="w-full text-sm text-gray-900 dark:text-neutral-100 placeholder:text-gray-400 dark:placeholder:text-neutral-500 bg-transparent border-0 outline-none ring-0 focus:outline-none focus:ring-0 appearance-none"
                 style={{ colorScheme: theme }}
                 disabled={loading || !ready}
               />
 
-              <div className="relative">
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setModelMenuOpen((prev) => !prev);
-                  }}
-                  disabled={loading || !ready}
-                  className="flex items-center gap-1 text-xs text-gray-500 dark:text-neutral-400 hover:bg-gray-100 dark:hover:bg-neutral-800 rounded-md px-2 py-1 transition-colors disabled:opacity-50"
-                >
-                  {currentModelLabel}
-                  <svg
-                    xmlns="http://www.w3.org/2000/svg"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    className="h-3 w-3"
+              <div className="flex items-center justify-between gap-2 pb-0.5">
+                <div className="flex items-center gap-2.5">
+                  <button
+                    type="button"
+                    onClick={() => void handleToggleRag()}
+                    disabled={loading || !ready}
+                    className={`flex items-center gap-1.5 text-xs rounded-full px-3 py-1.5 transition-colors disabled:opacity-50 ${
+                      ragEnabled
+                        ? 'bg-[#CC785C]/15 text-[#CC785C] dark:bg-[#CC785C]/20 dark:text-[#E8A27C]'
+                        : 'bg-gray-100 text-gray-500 dark:bg-neutral-800 dark:text-neutral-400'
+                    }`}
                   >
-                    <path d="m6 9 6 6 6-6" />
-                  </svg>
-                </button>
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      className="h-3.5 w-3.5"
+                    >
+                      <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+                      <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z" />
+                    </svg>
+                    Knowledge base
+                  </button>
 
-                {modelMenuOpen && (
-                  <div
-                    onClick={(e) => e.stopPropagation()}
-                    className="absolute bottom-full right-0 mb-2 w-40 rounded-lg border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 shadow-lg py-1 z-10"
-                  >
-                    {MODEL_OPTIONS.map((option) => (
+                  {ragEnabled && (
+                    <div className="flex items-center rounded-full bg-gray-100 dark:bg-neutral-800 p-1 gap-0.5 text-xs">
                       <button
-                        key={option.alias}
                         type="button"
-                        onClick={() => {
-                          setSelectedModel(option.alias);
-                          setModelMenuOpen(false);
-                        }}
-                        className={`w-full text-left text-sm px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700 ${
-                          option.alias === selectedModel
-                            ? 'text-gray-900 dark:text-neutral-100 font-medium'
-                            : 'text-gray-600 dark:text-neutral-400'
+                        onClick={() => void handleSetRetrievalMode('chunks')}
+                        disabled={loading || !ready}
+                        className={`rounded-full px-2 py-0.5 transition-colors disabled:opacity-50 ${
+                          retrievalMode === 'chunks'
+                            ? 'bg-white dark:bg-neutral-700 text-gray-800 dark:text-neutral-100 shadow-sm'
+                            : 'text-gray-500 dark:text-neutral-400'
                         }`}
                       >
-                        {option.label}
+                        Chunks
                       </button>
-                    ))}
-                  </div>
-                )}
-              </div>
+                      <button
+                        type="button"
+                        onClick={() => void handleSetRetrievalMode('graph')}
+                        disabled={loading || !ready}
+                        className={`rounded-full px-2 py-0.5 transition-colors disabled:opacity-50 ${
+                          retrievalMode === 'graph'
+                            ? 'bg-white dark:bg-neutral-700 text-gray-800 dark:text-neutral-100 shadow-sm'
+                            : 'text-gray-500 dark:text-neutral-400'
+                        }`}
+                      >
+                        Graph
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleSetRetrievalMode('both')}
+                        disabled={loading || !ready}
+                        className={`rounded-full px-2 py-0.5 transition-colors disabled:opacity-50 ${
+                          retrievalMode === 'both'
+                            ? 'bg-white dark:bg-neutral-700 text-gray-800 dark:text-neutral-100 shadow-sm'
+                            : 'text-gray-500 dark:text-neutral-400'
+                        }`}
+                      >
+                        Both
+                      </button>
+                    </div>
+                  )}
+                </div>
 
-              <button
-                type="submit"
-                disabled={loading || !ready || !input.trim()}
-                className="h-9 w-9 shrink-0 rounded-full bg-[#CC785C] hover:bg-[#B8684E] text-white flex items-center justify-center disabled:opacity-40 transition-colors"
-              >
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  className="h-4 w-4"
-                >
-                  <path d="M12 19V5" />
-                  <path d="m5 12 7-7 7 7" />
-                </svg>
-              </button>
+                <div className="flex items-center gap-3">
+                  <div className="relative">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setModelMenuOpen((prev) => !prev);
+                      }}
+                      disabled={loading || !ready}
+                      className="flex items-center gap-1 text-xs text-gray-500 dark:text-neutral-400 hover:bg-gray-100 dark:hover:bg-neutral-800 rounded-md px-2.5 py-1.5 transition-colors disabled:opacity-50"
+                    >
+                      {currentModelLabel}
+                      <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        className="h-3 w-3"
+                      >
+                        <path d="m6 9 6 6 6-6" />
+                      </svg>
+                    </button>
+
+                    {modelMenuOpen && (
+                      <div
+                        onClick={(e) => e.stopPropagation()}
+                        className="absolute bottom-full right-0 mb-2 w-40 rounded-lg border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 shadow-lg py-1 z-10"
+                      >
+                        {MODEL_OPTIONS.map((option) => (
+                          <button
+                            key={option.alias}
+                            type="button"
+                            onClick={() => {
+                              setSelectedModel(option.alias);
+                              setModelMenuOpen(false);
+                            }}
+                            className={`w-full text-left text-sm px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700 ${
+                              option.alias === selectedModel
+                                ? 'text-gray-900 dark:text-neutral-100 font-medium'
+                                : 'text-gray-600 dark:text-neutral-400'
+                            }`}
+                          >
+                            {option.label}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={loading || !ready || !input.trim()}
+                    className="h-8 w-8 shrink-0 rounded-full bg-[#CC785C] hover:bg-[#B8684E] text-white flex items-center justify-center disabled:opacity-40 transition-colors"
+                  >
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      className="h-4 w-4"
+                    >
+                      <path d="M12 19V5" />
+                      <path d="m5 12 7-7 7 7" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
             </form>
           </div>
         </div>
