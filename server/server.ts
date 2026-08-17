@@ -1,5 +1,9 @@
 import { createApp, server, serving, lakebase } from '@databricks/appkit';
 import { randomUUID } from 'node:crypto';
+import multer from 'multer';
+import { PDFParse } from 'pdf-parse';
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
 interface TitleContentPart {
   type?: string;
@@ -87,6 +91,18 @@ function chunkText(text: string, targetChars = 3200, overlapChars = 400): string
 
   if (current) chunks.push(current);
   return chunks;
+}
+
+async function extractTextFromUpload(filename: string, buffer: Buffer): Promise<string> {
+  const ext = filename.toLowerCase().split('.').pop();
+  if (ext === 'pdf') {
+    const parser = new PDFParse({ data: buffer });
+    const result = await parser.getText();
+    await parser.destroy();
+    return result.text;
+  }
+  // .txt, .md, and anything else: treat as plain UTF-8 text.
+  return buffer.toString('utf-8');
 }
 
 interface RetrievedSource {
@@ -274,20 +290,29 @@ await createApp({
     }
 
     AppKit.server.extend((app) => {
-      app.post('/api/rag/documents', async (req, res) => {
-        const { filename, content } = req.body as { filename?: string; content?: string };
-        if (!filename || !content) {
-          res.status(400).json({ error: 'filename and content are required' });
+      app.post('/api/rag/documents', upload.single('file'), async (req, res) => {
+        const file = req.file;
+        if (!file) {
+          res.status(400).json({ error: 'file is required (multipart field name: "file")' });
+          return;
+        }
+
+        let text: string;
+        try {
+          text = await extractTextFromUpload(file.originalname, file.buffer);
+        } catch (err) {
+          console.error('[rag-upload] text extraction failed:', err);
+          res.status(400).json({ error: 'Could not extract text from this file' });
           return;
         }
 
         const { rows } = await AppKit.lakebase.query(
           `INSERT INTO rag.documents (filename) VALUES ($1) RETURNING id, filename, status, error_message, chunk_count, uploaded_at`,
-          [filename],
+          [file.originalname],
         );
         const document = rows[0];
 
-        void ingestDocument(document.id, content);
+        void ingestDocument(document.id, text);
 
         res.json(document);
       });
@@ -297,6 +322,11 @@ await createApp({
           `SELECT id, filename, status, error_message, chunk_count, uploaded_at FROM rag.documents ORDER BY uploaded_at DESC`,
         );
         res.json(rows);
+      });
+
+      app.delete('/api/rag/documents/:id', async (req, res) => {
+        await AppKit.lakebase.query(`DELETE FROM rag.documents WHERE id = $1`, [req.params.id]);
+        res.status(204).end();
       });
 
       app.post('/api/rag/retrieve', async (req, res) => {

@@ -4,6 +4,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
 import { ChatSidebar } from '../../components/ChatSidebar';
+import { DocumentsPanel } from '../../components/DocumentsPanel';
 
 interface ChatContentPart {
   type?: string;
@@ -58,6 +59,15 @@ interface ChatSummary {
   rag_enabled: boolean;
   created_at: string;
   updated_at: string;
+}
+
+interface RagDocument {
+  id: string;
+  filename: string;
+  status: 'pending' | 'processing' | 'indexed' | 'failed';
+  error_message: string | null;
+  chunk_count: number;
+  uploaded_at: string;
 }
 
 interface ServingPageProps {
@@ -207,6 +217,8 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
   const [selectedModel, setSelectedModel] = useState<ModelAlias>(MODEL_OPTIONS[0].alias);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [ragEnabled, setRagEnabled] = useState(false);
+  const [documents, setDocuments] = useState<RagDocument[]>([]);
+  const [documentsPanelOpen, setDocumentsPanelOpen] = useState(false);
 
   const { invoke, loading, error } = useServingInvoke(
     { messages: [] },
@@ -234,6 +246,30 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
     return list;
   }
 
+  async function refreshDocuments() {
+    const list: RagDocument[] = await fetch('/api/rag/documents').then((r) => r.json());
+    setDocuments(list);
+  }
+
+  async function handleUploadDocument(file: File) {
+    const formData = new FormData();
+    formData.append('file', file);
+    await fetch('/api/rag/documents', { method: 'POST', body: formData });
+    await refreshDocuments();
+    // Poll briefly to catch the pending -> indexed transition without manual refresh.
+    let attempts = 0;
+    const interval = setInterval(async () => {
+      attempts += 1;
+      await refreshDocuments();
+      if (attempts >= 10) clearInterval(interval);
+    }, 2000);
+  }
+
+  async function handleDeleteDocument(id: string) {
+    setDocuments((prev) => prev.filter((d) => d.id !== id));
+    await fetch(`/api/rag/documents/${id}`, { method: 'DELETE' });
+  }
+
   async function loadMessagesFor(id: string) {
     const history: Message[] = await fetch(`/api/chats/${id}/messages`).then((r) => r.json());
     setMessages(history);
@@ -243,6 +279,7 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
     setReady(false);
     try {
       const list = await refreshChats();
+      await refreshDocuments();
 
       let active: ChatSummary;
       if (list.length > 0) {
@@ -436,6 +473,8 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
         onNewChat={() => void handleNewChat()}
         onRenameChat={(id, title) => void handleRenameChat(id, title)}
         onDeleteChat={(id) => void handleDeleteChat(id)}
+        onOpenDocuments={() => setDocumentsPanelOpen(true)}
+        documentCount={documents.length}
         disabled={loading || !ready}
         theme={theme}
         onToggleTheme={onToggleTheme}
@@ -609,6 +648,15 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
           </div>
         </div>
       </div>
+
+      <DocumentsPanel
+        open={documentsPanelOpen}
+        onClose={() => setDocumentsPanelOpen(false)}
+        documents={documents}
+        onUpload={(file) => void handleUploadDocument(file)}
+        onDelete={(id) => void handleDeleteDocument(id)}
+        theme={theme}
+      />
     </div>
   );
 }
