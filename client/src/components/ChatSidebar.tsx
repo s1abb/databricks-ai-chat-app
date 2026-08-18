@@ -9,8 +9,6 @@ interface ChatSummary {
 }
 
 interface ChatSidebarProps {
-  connected: boolean;
-  projectName: string;
   chats: ChatSummary[];
   activeChatId: string | null;
   onSelectChat: (id: string) => void;
@@ -30,8 +28,6 @@ function chatLabel(chat: ChatSummary): string {
 }
 
 export function ChatSidebar({
-  connected,
-  projectName,
   chats,
   activeChatId,
   onSelectChat,
@@ -73,9 +69,8 @@ export function ChatSidebar({
   return (
     <aside className="w-72 shrink-0 border-r border-gray-200 dark:border-neutral-800 bg-gray-50 dark:bg-neutral-950 flex flex-col h-full">
       <div className="px-4 py-4 flex items-center gap-2">
-        <span className="text-lg">💬</span>
         <span className="font-semibold text-sm text-gray-900 dark:text-neutral-100 flex-1">
-          databricks-ai-chat-app
+          Databricks Graph Chat
         </span>
         <button
           type="button"
@@ -162,25 +157,6 @@ export function ChatSidebar({
             </span>
           )}
         </button>
-      </div>
-
-      <div className="px-3 mt-3">
-        <div className="rounded-xl bg-gray-100 dark:bg-neutral-900 p-3">
-          <div className="flex items-center gap-2 mb-1">
-            <span
-              className={`h-2 w-2 rounded-full ${connected ? 'bg-green-500 animate-pulse' : 'bg-gray-400 dark:bg-neutral-600'}`}
-            />
-            <span className="text-[11px] font-semibold tracking-wide text-gray-500 dark:text-neutral-400">
-              LAKEBASE
-            </span>
-          </div>
-          <div className="text-sm font-medium text-gray-900 dark:text-neutral-100">
-            {projectName}
-          </div>
-          <div className="text-xs text-gray-500 dark:text-neutral-400 mt-1">
-            Conversations are saved automatically
-          </div>
-        </div>
       </div>
 
       <div className="px-3 mt-5 flex-1 overflow-y-auto">

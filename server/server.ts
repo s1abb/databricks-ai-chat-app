@@ -249,6 +249,24 @@ await createApp({
       )
     `);
 
+    await AppKit.lakebase.query(`CREATE SCHEMA IF NOT EXISTS app_config`);
+    await AppKit.lakebase.query(`
+      CREATE TABLE IF NOT EXISTS app_config.settings (
+        id TEXT PRIMARY KEY DEFAULT 'default',
+        system_prompt TEXT DEFAULT ''
+      )
+    `);
+    await AppKit.lakebase.query(
+      `
+        INSERT INTO app_config.settings (id, system_prompt)
+        VALUES ('default', $1)
+        ON CONFLICT (id) DO NOTHING
+      `,
+      [
+        'You are a helpful assistant for this internal chat application. When the Knowledge base toggle is switched on, you will be given retrieved context from uploaded documents and, depending on the retrieval mode, extracted entities and relationships from a knowledge graph built from those documents. Use that context to answer accurately, and cite sources inline using the numbering provided (e.g. [1], [2]). If the retrieved context does not contain enough information to answer confidently, say so rather than guessing. When the Knowledge base toggle is off, answer using your own general knowledge, and be clear when you are uncertain. Keep responses clear, direct, and free of unnecessary preamble.',
+      ],
+    );
+
     async function maybeGenerateTitle(chatId: string, userContent: string, assistantContent: string) {
       const { rows: countRows } = await AppKit.lakebase.query(
         `SELECT count(*)::int AS count FROM chat.messages WHERE chat_id = $1`,
@@ -341,13 +359,22 @@ ${chunkText}`,
 
         const raw = extractText(result).trim();
         const parsed = parseJsonLoose(raw) as {
-          entities?: ExtractedEntity[];
-          relationships?: ExtractedRelationship[];
+          entities?: (Partial<ExtractedEntity> | null)[];
+          relationships?: (Partial<ExtractedRelationship> | null)[];
         };
-        return {
-          entities: parsed.entities ?? [],
-          relationships: parsed.relationships ?? [],
-        };
+
+        const entities = (parsed.entities ?? []).filter(
+          (e): e is ExtractedEntity => typeof e?.name === 'string' && e.name.trim().length > 0,
+        );
+        const relationships = (parsed.relationships ?? []).filter(
+          (r): r is ExtractedRelationship =>
+            typeof r?.source === 'string' &&
+            r.source.trim().length > 0 &&
+            typeof r?.target === 'string' &&
+            r.target.trim().length > 0,
+        );
+
+        return { entities, relationships };
       } catch (err) {
         console.error('[entity-extraction] failed for chunk:', err);
         return { entities: [], relationships: [] };
@@ -438,8 +465,11 @@ ${chunkText}`,
         documentId,
       ]);
 
+      let chunks: string[];
+      const chunkIds: string[] = [];
+
       try {
-        const chunks = chunkText(text);
+        chunks = chunkText(text);
         if (chunks.length === 0) {
           throw new Error('Document produced no chunks (empty content?)');
         }
@@ -449,7 +479,6 @@ ${chunkText}`,
           chunks,
         );
 
-        const chunkIds: string[] = [];
         for (let i = 0; i < chunks.length; i++) {
           const chunkId = randomUUID();
           chunkIds.push(chunkId);
@@ -463,16 +492,21 @@ ${chunkText}`,
           `UPDATE rag.documents SET status = 'indexed', chunk_count = $2 WHERE id = $1`,
           [documentId, chunks.length],
         );
-
-        for (let i = 0; i < chunks.length; i++) {
-          await processChunkGraph(chunkIds[i], chunks[i]);
-        }
       } catch (err) {
         console.error('[rag-ingest] failed:', err);
         await AppKit.lakebase.query(
           `UPDATE rag.documents SET status = 'failed', error_message = $2 WHERE id = $1`,
           [documentId, String(err)],
         );
+        return;
+      }
+
+      for (let i = 0; i < chunks.length; i++) {
+        try {
+          await processChunkGraph(chunkIds[i], chunks[i]);
+        } catch (err) {
+          console.error(`[graph-extraction] chunk ${i} failed:`, err);
+        }
       }
     }
 
@@ -629,6 +663,34 @@ ${chunkText}`,
     }
 
     AppKit.server.extend((app) => {
+      app.get('/api/whoami', async (req, res) => {
+        const email = req.headers['x-forwarded-email'] as string | undefined;
+        const username = req.headers['x-forwarded-preferred-username'] as string | undefined;
+        res.json({
+          email: email || 'local-dev@localhost',
+          username: username || email?.split('@')[0] || 'Developer',
+        });
+      });
+
+      app.get('/api/settings', async (_req, res) => {
+        const { rows } = await AppKit.lakebase.query(
+          `SELECT system_prompt FROM app_config.settings WHERE id = 'default'`,
+        );
+        res.json({ systemPrompt: rows[0]?.system_prompt ?? '' });
+      });
+
+      app.put('/api/settings', async (req, res) => {
+        const { systemPrompt } = req.body as { systemPrompt?: string };
+        await AppKit.lakebase.query(
+          `
+            INSERT INTO app_config.settings (id, system_prompt) VALUES ('default', $1)
+            ON CONFLICT (id) DO UPDATE SET system_prompt = $1
+          `,
+          [systemPrompt ?? ''],
+        );
+        res.json({ systemPrompt: systemPrompt ?? '' });
+      });
+
       app.post('/api/rag/documents', upload.single('file'), async (req, res) => {
         const file = req.file;
         if (!file) {
@@ -704,6 +766,18 @@ ${chunkText}`,
         await AppKit.lakebase.query(`DELETE FROM rag.documents WHERE id = $1`, [documentId]);
         res.status(204).end();
       });
+
+      app.post('/api/rag/reset', async (_req, res) => {
+        try {
+          await AppKit.lakebase.query(
+            `TRUNCATE rag.relationships, rag.entities, rag.chunks, rag.documents`,
+          );
+          res.json({ ok: true });
+        } catch (err) {
+          console.error('[rag-reset] failed:', err);
+          res.status(500).json({ error: String(err) });
+        }
+      });      
 
       app.get('/api/rag/graph-stats', async (_req, res) => {
         const { rows: entityRows } = await AppKit.lakebase.query(

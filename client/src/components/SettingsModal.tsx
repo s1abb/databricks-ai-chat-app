@@ -4,17 +4,28 @@ interface SettingsModalProps {
   open: boolean;
   onClose: () => void;
   theme: 'light' | 'dark';
+  onDatabaseReset: () => void;
+  connected: boolean;
+  projectName: string;
 }
 
-type Tab = 'general';
+type Tab = 'general' | 'database';
 
-export function SettingsModal({ open, onClose, theme }: SettingsModalProps) {
+export function SettingsModal({
+  open,
+  onClose,
+  theme,
+  onDatabaseReset,
+  connected,
+  projectName,
+}: SettingsModalProps) {
   const [activeTab, setActiveTab] = useState<Tab>('general');
   const [systemPrompt, setSystemPrompt] = useState('');
   const [savedPrompt, setSavedPrompt] = useState('');
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [resetStep, setResetStep] = useState<'idle' | 'confirm' | 'resetting' | 'done'>('idle');
 
   useEffect(() => {
     if (!open) return;
@@ -41,6 +52,18 @@ export function SettingsModal({ open, onClose, theme }: SettingsModalProps) {
       setTimeout(() => setSaved(false), 1500);
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleReset() {
+    setResetStep('resetting');
+    try {
+      await fetch('/api/rag/reset', { method: 'POST' });
+      setResetStep('done');
+      onDatabaseReset();
+      setTimeout(() => setResetStep('idle'), 2000);
+    } catch {
+      setResetStep('idle');
     }
   }
 
@@ -94,6 +117,17 @@ export function SettingsModal({ open, onClose, theme }: SettingsModalProps) {
             >
               General
             </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab('database')}
+              className={`w-full text-left text-sm rounded-lg px-3 py-2 transition-colors ${
+                activeTab === 'database'
+                  ? 'bg-gray-100 dark:bg-neutral-800 text-gray-900 dark:text-neutral-100 font-medium'
+                  : 'text-gray-500 dark:text-neutral-400 hover:bg-gray-50 dark:hover:bg-neutral-800/60'
+              }`}
+            >
+              Database
+            </button>
           </div>
 
           <div className="flex-1 overflow-y-auto p-5">
@@ -135,6 +169,86 @@ export function SettingsModal({ open, onClose, theme }: SettingsModalProps) {
                     </div>
                   </>
                 )}
+              </div>
+            )}
+
+            {activeTab === 'database' && (
+              <div className="flex flex-col gap-4">
+                <div>
+                  <h3 className="text-sm font-medium text-gray-800 dark:text-neutral-200">
+                    Connection
+                  </h3>
+                </div>
+
+                <div className="rounded-xl bg-gray-100 dark:bg-neutral-800 p-3">
+                  <div className="flex items-center gap-2 mb-1">
+                    <span
+                      className={`h-2 w-2 rounded-full ${connected ? 'bg-green-500 animate-pulse' : 'bg-gray-400 dark:bg-neutral-600'}`}
+                    />
+                    <span className="text-[11px] font-semibold tracking-wide text-gray-500 dark:text-neutral-400">
+                      LAKEBASE
+                    </span>
+                  </div>
+                  <div className="text-sm font-medium text-gray-900 dark:text-neutral-100">
+                    {projectName}
+                  </div>
+                </div>
+
+                <div>
+                  <h3 className="text-sm font-medium text-gray-800 dark:text-neutral-200">
+                    Knowledge base
+                  </h3>
+                  <p className="text-xs text-gray-500 dark:text-neutral-400 mt-0.5">
+                    Permanently deletes every uploaded document, chunk, entity, and relationship.
+                    This does not affect chat history.
+                  </p>
+                </div>
+
+                <div className="rounded-lg border border-red-200 dark:border-red-900/50 bg-red-50 dark:bg-red-900/10 p-4">
+                  {resetStep === 'idle' && (
+                    <button
+                      type="button"
+                      onClick={() => setResetStep('confirm')}
+                      className="text-sm font-medium text-red-600 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300"
+                    >
+                      Clear knowledge base
+                    </button>
+                  )}
+
+                  {resetStep === 'confirm' && (
+                    <div className="flex flex-col gap-2">
+                      <p className="text-sm text-red-700 dark:text-red-300">
+                        This can't be undone. Delete all documents and knowledge graph data?
+                      </p>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => void handleReset()}
+                          className="rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm px-3 py-1.5 transition-colors"
+                        >
+                          Yes, delete everything
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setResetStep('idle')}
+                          className="text-sm text-gray-500 dark:text-neutral-400 hover:text-gray-700 dark:hover:text-neutral-200"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {resetStep === 'resetting' && (
+                    <p className="text-sm text-gray-500 dark:text-neutral-400">Deleting...</p>
+                  )}
+
+                  {resetStep === 'done' && (
+                    <p className="text-sm text-green-600 dark:text-green-400">
+                      Knowledge base cleared.
+                    </p>
+                  )}
+                </div>
               </div>
             )}
           </div>

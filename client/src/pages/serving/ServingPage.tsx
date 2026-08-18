@@ -473,8 +473,6 @@ Question: ${userContent}`;
   return (
     <div className="h-screen w-full flex bg-white dark:bg-neutral-950">
       <ChatSidebar
-        connected={connected}
-        projectName="chat-app-db"
         chats={chats}
         activeChatId={chatId}
         onSelectChat={(id) => void handleSelectChat(id)}
@@ -739,6 +737,9 @@ Question: ${userContent}`;
         open={settingsModalOpen}
         onClose={() => setSettingsModalOpen(false)}
         theme={theme}
+        onDatabaseReset={() => void refreshDocuments()}
+        connected={connected}
+        projectName="chat-app-db"
       />
     </div>
   );
