@@ -6,6 +6,7 @@ import rehypeRaw from 'rehype-raw';
 import { ChatSidebar } from '../../components/ChatSidebar';
 import { DocumentsPanel } from '../../components/DocumentsPanel';
 import { CitationModal } from '../../components/CitationModal';
+import { SettingsModal } from '../../components/SettingsModal';
 
 interface ChatContentPart {
   type?: string;
@@ -186,6 +187,8 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
     sources: RetrievedSource[];
     focusIndex: number;
   } | null>(null);
+  const [settingsModalOpen, setSettingsModalOpen] = useState(false);
+  const [systemPrompt, setSystemPrompt] = useState('');
 
   const { invoke, loading, error } = useServingInvoke(
     { messages: [] },
@@ -246,6 +249,10 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
     try {
       const list = await refreshChats();
       await refreshDocuments();
+      fetch('/api/settings')
+        .then((r) => r.json())
+        .then((data: { systemPrompt: string }) => setSystemPrompt(data.systemPrompt))
+        .catch(() => {});
 
       let active: ChatSummary;
       if (list.length > 0) {
@@ -424,7 +431,15 @@ Question: ${userContent}`;
       }
     }
 
+    const systemPreamble = systemPrompt.trim()
+      ? [
+          { role: 'user' as const, content: `System instructions: ${systemPrompt.trim()}` },
+          { role: 'assistant' as const, content: 'Understood.' },
+        ]
+      : [];
+
     const fullMessages = [
+      ...systemPreamble,
       ...messages.map(({ role, content: c }) => ({ role, content: c })),
       { role: 'user' as const, content: augmentedUserContent },
     ];
@@ -467,6 +482,7 @@ Question: ${userContent}`;
         onRenameChat={(id, title) => void handleRenameChat(id, title)}
         onDeleteChat={(id) => void handleDeleteChat(id)}
         onOpenDocuments={() => setDocumentsPanelOpen(true)}
+        onOpenSettings={() => setSettingsModalOpen(true)}
         documentCount={documents.length}
         disabled={loading || !ready}
         theme={theme}
@@ -588,7 +604,7 @@ Question: ${userContent}`;
                         type="button"
                         onClick={() => void handleSetRetrievalMode('chunks')}
                         disabled={loading || !ready}
-                        className={`rounded-full px-2 py-0.5 transition-colors disabled:opacity-50 ${
+                        className={`rounded-full px-2.5 py-1 transition-colors disabled:opacity-50 ${
                           retrievalMode === 'chunks'
                             ? 'bg-white dark:bg-neutral-700 text-gray-800 dark:text-neutral-100 shadow-sm'
                             : 'text-gray-500 dark:text-neutral-400'
@@ -600,7 +616,7 @@ Question: ${userContent}`;
                         type="button"
                         onClick={() => void handleSetRetrievalMode('graph')}
                         disabled={loading || !ready}
-                        className={`rounded-full px-2 py-0.5 transition-colors disabled:opacity-50 ${
+                        className={`rounded-full px-2.5 py-1 transition-colors disabled:opacity-50 ${
                           retrievalMode === 'graph'
                             ? 'bg-white dark:bg-neutral-700 text-gray-800 dark:text-neutral-100 shadow-sm'
                             : 'text-gray-500 dark:text-neutral-400'
@@ -612,7 +628,7 @@ Question: ${userContent}`;
                         type="button"
                         onClick={() => void handleSetRetrievalMode('both')}
                         disabled={loading || !ready}
-                        className={`rounded-full px-2 py-0.5 transition-colors disabled:opacity-50 ${
+                        className={`rounded-full px-2.5 py-1 transition-colors disabled:opacity-50 ${
                           retrievalMode === 'both'
                             ? 'bg-white dark:bg-neutral-700 text-gray-800 dark:text-neutral-100 shadow-sm'
                             : 'text-gray-500 dark:text-neutral-400'
@@ -716,6 +732,12 @@ Question: ${userContent}`;
         onClose={() => setCitationModal(null)}
         sources={citationModal?.sources ?? []}
         focusIndex={citationModal?.focusIndex}
+        theme={theme}
+      />
+
+      <SettingsModal
+        open={settingsModalOpen}
+        onClose={() => setSettingsModalOpen(false)}
         theme={theme}
       />
     </div>

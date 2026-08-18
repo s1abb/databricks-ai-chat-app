@@ -64,6 +64,12 @@ function toVectorLiteral(vec: number[]): string {
   return `[${vec.join(',')}]`;
 }
 
+function getCurrentUserId(req: { headers: Record<string, string | string[] | undefined> }): string {
+  const email = req.headers['x-forwarded-email'];
+  if (typeof email === 'string' && email) return email;
+  return 'local-dev@localhost';
+}
+
 async function embedInBatches(
   invokeEmbed: (input: string[]) => Promise<unknown>,
   texts: string[],
@@ -185,6 +191,9 @@ await createApp({
     );
     await AppKit.lakebase.query(
       `ALTER TABLE chat.chats ADD COLUMN IF NOT EXISTS retrieval_mode TEXT DEFAULT 'chunks'`,
+    );
+    await AppKit.lakebase.query(
+      `ALTER TABLE chat.chats ADD COLUMN IF NOT EXISTS user_id TEXT`,
     );
     await AppKit.lakebase.query(`
       CREATE TABLE IF NOT EXISTS chat.messages (
@@ -664,7 +673,6 @@ ${chunkText}`,
         const chunkIdsToRemove: string[] = chunkRows.map((r: { id: string }) => r.id);
 
         if (chunkIdsToRemove.length > 0) {
-          // Strip this document's chunk IDs from any entity that references them.
           await AppKit.lakebase.query(
             `
               UPDATE rag.entities
@@ -676,13 +684,8 @@ ${chunkText}`,
             [chunkIdsToRemove],
           );
 
-          // Entities with no remaining provenance (only supported by this
-          // document) are now orphaned - delete them. This cascades to
-          // delete any relationships involving them, via the existing FK.
           await AppKit.lakebase.query(`DELETE FROM rag.entities WHERE source_chunk_ids = '{}'`);
 
-          // Same logic for relationships that survived (both endpoints
-          // still exist) but whose own provenance included this document.
           await AppKit.lakebase.query(
             `
               UPDATE rag.relationships
@@ -698,8 +701,6 @@ ${chunkText}`,
           );
         }
 
-        // Chunks cascade-delete automatically via the existing FK once the
-        // document row itself is removed.
         await AppKit.lakebase.query(`DELETE FROM rag.documents WHERE id = $1`, [documentId]);
         res.status(204).end();
       });
@@ -737,50 +738,67 @@ ${chunkText}`,
         }
       });
 
-      app.post('/api/chats', async (_req, res) => {
+      app.post('/api/chats', async (req, res) => {
+        const userId = getCurrentUserId(req);
         const { rows } = await AppKit.lakebase.query(
-          `INSERT INTO chat.chats DEFAULT VALUES RETURNING id, title, last_model, rag_enabled, retrieval_mode, created_at, updated_at`,
+          `INSERT INTO chat.chats (user_id) VALUES ($1) RETURNING id, title, last_model, rag_enabled, retrieval_mode, created_at, updated_at`,
+          [userId],
         );
         res.json(rows[0]);
       });
 
-      app.get('/api/chats', async (_req, res) => {
+      app.get('/api/chats', async (req, res) => {
+        const userId = getCurrentUserId(req);
         const { rows } = await AppKit.lakebase.query(
-          `SELECT id, title, last_model, rag_enabled, retrieval_mode, created_at, updated_at FROM chat.chats ORDER BY updated_at DESC`,
+          `SELECT id, title, last_model, rag_enabled, retrieval_mode, created_at, updated_at FROM chat.chats WHERE user_id = $1 ORDER BY updated_at DESC`,
+          [userId],
         );
         res.json(rows);
       });
 
       app.patch('/api/chats/:chatId', async (req, res) => {
+        const userId = getCurrentUserId(req);
         const { title, rag_enabled, retrieval_mode } = req.body as {
           title?: string;
           rag_enabled?: boolean;
-          retrieval_mode?: 'chunks' | 'graph';
+          retrieval_mode?: 'chunks' | 'graph' | 'both';
         };
 
         if (title !== undefined) {
           const { rows } = await AppKit.lakebase.query(
-            `UPDATE chat.chats SET title = $1 WHERE id = $2 RETURNING id, title, last_model, rag_enabled, retrieval_mode, created_at, updated_at`,
-            [title, req.params.chatId],
+            `UPDATE chat.chats SET title = $1 WHERE id = $2 AND user_id = $3 RETURNING id, title, last_model, rag_enabled, retrieval_mode, created_at, updated_at`,
+            [title, req.params.chatId, userId],
           );
+          if (rows.length === 0) {
+            res.status(404).json({ error: 'Chat not found' });
+            return;
+          }
           res.json(rows[0]);
           return;
         }
 
         if (rag_enabled !== undefined) {
           const { rows } = await AppKit.lakebase.query(
-            `UPDATE chat.chats SET rag_enabled = $1 WHERE id = $2 RETURNING id, title, last_model, rag_enabled, retrieval_mode, created_at, updated_at`,
-            [rag_enabled, req.params.chatId],
+            `UPDATE chat.chats SET rag_enabled = $1 WHERE id = $2 AND user_id = $3 RETURNING id, title, last_model, rag_enabled, retrieval_mode, created_at, updated_at`,
+            [rag_enabled, req.params.chatId, userId],
           );
+          if (rows.length === 0) {
+            res.status(404).json({ error: 'Chat not found' });
+            return;
+          }
           res.json(rows[0]);
           return;
         }
 
         if (retrieval_mode !== undefined) {
           const { rows } = await AppKit.lakebase.query(
-            `UPDATE chat.chats SET retrieval_mode = $1 WHERE id = $2 RETURNING id, title, last_model, rag_enabled, retrieval_mode, created_at, updated_at`,
-            [retrieval_mode, req.params.chatId],
+            `UPDATE chat.chats SET retrieval_mode = $1 WHERE id = $2 AND user_id = $3 RETURNING id, title, last_model, rag_enabled, retrieval_mode, created_at, updated_at`,
+            [retrieval_mode, req.params.chatId, userId],
           );
+          if (rows.length === 0) {
+            res.status(404).json({ error: 'Chat not found' });
+            return;
+          }
           res.json(rows[0]);
           return;
         }
@@ -789,11 +807,25 @@ ${chunkText}`,
       });
 
       app.delete('/api/chats/:chatId', async (req, res) => {
-        await AppKit.lakebase.query(`DELETE FROM chat.chats WHERE id = $1`, [req.params.chatId]);
+        const userId = getCurrentUserId(req);
+        await AppKit.lakebase.query(`DELETE FROM chat.chats WHERE id = $1 AND user_id = $2`, [
+          req.params.chatId,
+          userId,
+        ]);
         res.status(204).end();
       });
 
       app.get('/api/chats/:chatId/messages', async (req, res) => {
+        const userId = getCurrentUserId(req);
+        const { rows: ownedChat } = await AppKit.lakebase.query(
+          `SELECT id FROM chat.chats WHERE id = $1 AND user_id = $2`,
+          [req.params.chatId, userId],
+        );
+        if (ownedChat.length === 0) {
+          res.status(404).json({ error: 'Chat not found' });
+          return;
+        }
+
         const { rows } = await AppKit.lakebase.query(
           `SELECT id, role, content, sources, created_at FROM chat.messages WHERE chat_id = $1 ORDER BY created_at ASC`,
           [req.params.chatId],
@@ -802,6 +834,16 @@ ${chunkText}`,
       });
 
       app.post('/api/chats/:chatId/messages', async (req, res) => {
+        const userId = getCurrentUserId(req);
+        const { rows: ownedChat } = await AppKit.lakebase.query(
+          `SELECT id FROM chat.chats WHERE id = $1 AND user_id = $2`,
+          [req.params.chatId, userId],
+        );
+        if (ownedChat.length === 0) {
+          res.status(404).json({ error: 'Chat not found' });
+          return;
+        }
+
         const { role, content, model, sources } = req.body as {
           role: 'user' | 'assistant';
           content: string;

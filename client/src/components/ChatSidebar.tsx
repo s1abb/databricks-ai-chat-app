@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { UserMenu } from './UserMenu';
 
 interface ChatSummary {
   id: string;
@@ -17,6 +18,7 @@ interface ChatSidebarProps {
   onRenameChat: (id: string, title: string) => void;
   onDeleteChat: (id: string) => void;
   onOpenDocuments: () => void;
+  onOpenSettings: () => void;
   documentCount: number;
   disabled?: boolean;
   theme: 'light' | 'dark';
@@ -37,6 +39,7 @@ export function ChatSidebar({
   onRenameChat,
   onDeleteChat,
   onOpenDocuments,
+  onOpenSettings,
   documentCount,
   disabled,
   theme,
@@ -271,8 +274,8 @@ export function ChatSidebar({
         </div>
       </div>
 
-      <div className="mt-auto px-4 py-3 text-xs text-gray-400 dark:text-neutral-500 border-t border-gray-200 dark:border-neutral-800">
-        Chat history is saved to Lakebase Postgres.
+      <div className="mt-auto">
+        <UserMenu onOpenSettings={onOpenSettings} theme={theme} />
       </div>
     </aside>
   );
