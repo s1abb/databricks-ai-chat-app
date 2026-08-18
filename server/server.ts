@@ -655,7 +655,52 @@ ${chunkText}`,
       });
 
       app.delete('/api/rag/documents/:id', async (req, res) => {
-        await AppKit.lakebase.query(`DELETE FROM rag.documents WHERE id = $1`, [req.params.id]);
+        const documentId = req.params.id;
+
+        const { rows: chunkRows } = await AppKit.lakebase.query(
+          `SELECT id FROM rag.chunks WHERE document_id = $1`,
+          [documentId],
+        );
+        const chunkIdsToRemove: string[] = chunkRows.map((r: { id: string }) => r.id);
+
+        if (chunkIdsToRemove.length > 0) {
+          // Strip this document's chunk IDs from any entity that references them.
+          await AppKit.lakebase.query(
+            `
+              UPDATE rag.entities
+              SET source_chunk_ids = array(
+                SELECT unnest(source_chunk_ids) EXCEPT SELECT unnest($1::uuid[])
+              )
+              WHERE source_chunk_ids && $1::uuid[]
+            `,
+            [chunkIdsToRemove],
+          );
+
+          // Entities with no remaining provenance (only supported by this
+          // document) are now orphaned - delete them. This cascades to
+          // delete any relationships involving them, via the existing FK.
+          await AppKit.lakebase.query(`DELETE FROM rag.entities WHERE source_chunk_ids = '{}'`);
+
+          // Same logic for relationships that survived (both endpoints
+          // still exist) but whose own provenance included this document.
+          await AppKit.lakebase.query(
+            `
+              UPDATE rag.relationships
+              SET source_chunk_ids = array(
+                SELECT unnest(source_chunk_ids) EXCEPT SELECT unnest($1::uuid[])
+              )
+              WHERE source_chunk_ids && $1::uuid[]
+            `,
+            [chunkIdsToRemove],
+          );
+          await AppKit.lakebase.query(
+            `DELETE FROM rag.relationships WHERE source_chunk_ids = '{}'`,
+          );
+        }
+
+        // Chunks cascade-delete automatically via the existing FK once the
+        // document row itself is removed.
+        await AppKit.lakebase.query(`DELETE FROM rag.documents WHERE id = $1`, [documentId]);
         res.status(204).end();
       });
 
