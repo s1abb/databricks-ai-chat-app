@@ -73,6 +73,7 @@ interface RagDocument {
   status: 'pending' | 'processing' | 'indexed' | 'failed';
   error_message: string | null;
   chunk_count: number;
+  processed_chunks: number;
   uploaded_at: string;
 }
 
@@ -196,6 +197,7 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
   );
 
   const bottomRef = useRef<HTMLDivElement>(null);
+  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -209,6 +211,12 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
     window.addEventListener('click', closeMenu);
     return () => window.removeEventListener('click', closeMenu);
   }, [modelMenuOpen]);
+
+  useEffect(() => {
+    return () => {
+      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+    };
+  }, []);
 
   async function refreshChats(): Promise<ChatSummary[]> {
     const list: ChatSummary[] = await fetch('/api/chats').then((r) => r.json());
@@ -226,12 +234,25 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
     formData.append('file', file);
     await fetch('/api/rag/documents', { method: 'POST', body: formData });
     await refreshDocuments();
-    let attempts = 0;
-    const interval = setInterval(async () => {
-      attempts += 1;
-      await refreshDocuments();
-      if (attempts >= 10) clearInterval(interval);
-    }, 2000);
+    startPollingIfNeeded();
+  }
+
+  function startPollingIfNeeded() {
+    if (pollIntervalRef.current) return;
+    pollIntervalRef.current = setInterval(async () => {
+      const list: RagDocument[] = await fetch('/api/rag/documents').then((r) => r.json());
+      setDocuments(list);
+      const stillWorking = list.some(
+        (d) =>
+          d.status === 'pending' ||
+          d.status === 'processing' ||
+          d.processed_chunks < d.chunk_count,
+      );
+      if (!stillWorking && pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
+      }
+    }, 3000);
   }
 
   async function handleDeleteDocument(id: string) {
@@ -249,6 +270,7 @@ export function ServingPage({ theme, onToggleTheme }: ServingPageProps) {
     try {
       const list = await refreshChats();
       await refreshDocuments();
+      startPollingIfNeeded();
       fetch('/api/settings')
         .then((r) => r.json())
         .then((data: { systemPrompt: string }) => setSystemPrompt(data.systemPrompt))

@@ -219,6 +219,9 @@ await createApp({
         uploaded_at TIMESTAMPTZ DEFAULT now()
       )
     `);
+    await AppKit.lakebase.query(
+      `ALTER TABLE rag.documents ADD COLUMN IF NOT EXISTS processed_chunks INT DEFAULT 0`,
+    );
     await AppKit.lakebase.query(`
       CREATE TABLE IF NOT EXISTS rag.chunks (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -506,6 +509,11 @@ ${chunkText}`,
           await processChunkGraph(chunkIds[i], chunks[i]);
         } catch (err) {
           console.error(`[graph-extraction] chunk ${i} failed:`, err);
+        } finally {
+          await AppKit.lakebase.query(
+            `UPDATE rag.documents SET processed_chunks = $2 WHERE id = $1`,
+            [documentId, i + 1],
+          );
         }
       }
     }
@@ -720,7 +728,7 @@ ${chunkText}`,
 
       app.get('/api/rag/documents', async (_req, res) => {
         const { rows } = await AppKit.lakebase.query(
-          `SELECT id, filename, status, error_message, chunk_count, uploaded_at FROM rag.documents ORDER BY uploaded_at DESC`,
+          `SELECT id, filename, status, error_message, chunk_count, processed_chunks, uploaded_at FROM rag.documents ORDER BY uploaded_at DESC`,
         );
         res.json(rows);
       });
@@ -777,7 +785,7 @@ ${chunkText}`,
           console.error('[rag-reset] failed:', err);
           res.status(500).json({ error: String(err) });
         }
-      });      
+      });
 
       app.get('/api/rag/graph-stats', async (_req, res) => {
         const { rows: entityRows } = await AppKit.lakebase.query(

@@ -6,6 +6,7 @@ interface RagDocument {
   status: 'pending' | 'processing' | 'indexed' | 'failed';
   error_message: string | null;
   chunk_count: number;
+  processed_chunks: number;
   uploaded_at: string;
 }
 
@@ -221,6 +222,16 @@ export function DocumentsPanel({
                       <div className="text-sm text-gray-800 dark:text-neutral-200 truncate">
                         {doc.filename}
                       </div>
+                      {doc.status === 'indexed' && doc.processed_chunks < doc.chunk_count && (
+                        <div className="w-full h-1 rounded-full bg-gray-200 dark:bg-neutral-700 mt-1 overflow-hidden">
+                          <div
+                            className="h-full bg-[#CC785C] transition-all"
+                            style={{
+                              width: `${Math.round((doc.processed_chunks / Math.max(doc.chunk_count, 1)) * 100)}%`,
+                            }}
+                          />
+                        </div>
+                      )}
                       {doc.status === 'failed' && doc.error_message && (
                         <div className="text-[11px] text-red-500 dark:text-red-400 truncate">
                           {doc.error_message}
@@ -228,8 +239,13 @@ export function DocumentsPanel({
                       )}
                     </div>
                   </div>
-                  <div className="w-20 flex justify-end">
+                  <div className="w-20 flex flex-col items-end gap-0.5">
                     <StatusBadge status={doc.status} />
+                    {doc.status === 'indexed' && doc.processed_chunks < doc.chunk_count && (
+                      <span className="text-[9px] text-gray-400 dark:text-neutral-500">
+                        graph {doc.processed_chunks}/{doc.chunk_count}
+                      </span>
+                    )}
                   </div>
                   <div className="w-16 text-right text-xs text-gray-400 dark:text-neutral-500 hidden sm:block">
                     {doc.status === 'indexed' ? doc.chunk_count : '—'}
